@@ -1,0 +1,61 @@
+====================================================================
+  TikTok AI Lyrics Video Editor - Start Commands (macOS & Windows)
+====================================================================
+
+--------------------------------------------------------------------
+1. macOS START COMMANDS (Terminal)
+--------------------------------------------------------------------
+
+[A] Backend Start (Terminal 1):
+cd "/Users/Ashan/my project/Tiktok video creator"
+./venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+(Without auto-reload):
+cd "/Users/Ashan/my project/Tiktok video creator"
+./venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+
+[B] Frontend Start (Terminal 2):
+cd "/Users/Ashan/my project/Tiktok video creator/frontend"
+npm run dev
+
+
+[C] Optional - Local AI Word-Level Sync (Install Once on macOS):
+cd "/Users/Ashan/my project/Tiktok video creator"
+./venv/bin/pip install torch torchaudio ctc-forced-aligner
+
+
+--------------------------------------------------------------------
+2. WINDOWS START COMMANDS (CMD / PowerShell)
+--------------------------------------------------------------------
+
+[A] One-Click Start (Easiest - Double Click or Run in CMD):
+setup_windows.bat      (First time only)
+start_windows.bat      (Starts Backend + Frontend + opens browser)
+
+
+[B] Backend Start Manually (CMD Terminal 1):
+cd /d "C:\path\to\Tiktok video creator"
+venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+(Without auto-reload):
+cd /d "C:\path\to\Tiktok video creator"
+venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+
+[C] Frontend Start Manually (CMD Terminal 2):
+cd /d "C:\path\to\Tiktok video creator\frontend"
+npm run dev
+
+
+[D] Optional - Local AI Word-Level Sync (Install Once on Windows):
+cd /d "C:\path\to\Tiktok video creator"
+venv\Scripts\pip.exe install torch torchaudio ctc-forced-aligner
+
+
+--------------------------------------------------------------------
+3. APP URLS
+--------------------------------------------------------------------
+Frontend UI : http://localhost:3000
+Backend API : http://localhost:8000
+Health Check: http://localhost:8000/api/health

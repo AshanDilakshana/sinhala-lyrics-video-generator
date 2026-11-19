@@ -1,0 +1,29 @@
+# Core FastAPI & Async Web Server (Python 3.10 - 3.14 compatible)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.18
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+python-dotenv>=1.0.1
+httpx>=0.28.0
+certifi>=2024.8.30
+aiofiles>=24.1.0
+
+# Media Downloading, Bundled FFmpeg & Image Masking
+yt-dlp>=2025.1.26
+ffmpeg-python>=0.2.0
+static-ffmpeg>=2.7
+imageio-ffmpeg>=0.5.1
+Pillow>=10.4.0
+numpy>=1.26.0
+
+# Audio Fingerprinting & Sinhala ASR Forced Alignment
+SpeechRecognition>=3.10.0
+shazamio>=0.7.0
+aiohttp-retry>=2.8.3
+audioop-lts>=0.2.1; python_version >= "3.13"
+standard-aifc>=3.13.0; python_version >= "3.13"
+
+# Optional Local AI Word-Level Sinhala Phoneme Forced Aligner (Meta MMS CTC)
+# Install with: pip install torch ctc-forced-aligner
+# ctc-forced-aligner>=0.3.0
