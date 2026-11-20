@@ -20,9 +20,9 @@ cd "/Users/Ashan/my project/Tiktok video creator/frontend"
 npm run dev
 
 
-[C] Optional - Local AI Word-Level Sync (Install Once on macOS):
+[C] Local AI Vocal Isolation & Word-Level Sync (Already Installed - Reference):
 cd "/Users/Ashan/my project/Tiktok video creator"
-./venv/bin/pip install torch torchaudio ctc-forced-aligner
+./venv/bin/pip install torch torchaudio demucs unidecode huggingface-hub
 
 
 --------------------------------------------------------------------
@@ -48,9 +48,9 @@ cd /d "C:\path\to\Tiktok video creator\frontend"
 npm run dev
 
 
-[D] Optional - Local AI Word-Level Sync (Install Once on Windows):
+[D] Local AI Vocal Isolation & Word-Level Sync (Windows Setup):
 cd /d "C:\path\to\Tiktok video creator"
-venv\Scripts\pip.exe install torch torchaudio ctc-forced-aligner
+venv\Scripts\pip.exe install torch torchaudio demucs unidecode huggingface-hub
 
 
 --------------------------------------------------------------------

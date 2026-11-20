@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import httpx
 
-from backend.config import TEMP_DIR
+from backend.config import TEMP_DIR, create_resilient_async_client
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ async def _load_multi_sitemap_urls(
     all_urls: List[str] = []
     seen = set()
     try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=BROWSER_HEADERS, verify=False) as client:
+        async with create_resilient_async_client(timeout=20.0, headers=BROWSER_HEADERS) as client:
             for sm_url in sitemap_urls:
                 try:
                     resp = await client.get(sm_url)
@@ -186,6 +186,7 @@ def _score_url_against_query(
     url: str,
     q_canon: List[str],
     q_joined: str,
+    artist_canon: Optional[List[str]] = None,
 ) -> Optional[Tuple[float, Dict[str, str]]]:
     """Score a `/song/...` or `/songs/...` URL slug against canonicalized Singlish tokens."""
     if "/songs/" in url:
@@ -204,6 +205,7 @@ def _score_url_against_query(
         return None
 
     song_canon = [_canonical_singlish_word(t) for t in song_tokens]
+    artist_slug_canon = [_canonical_singlish_word(t) for t in artist_tokens]
     all_canon = [_canonical_singlish_word(t) for t in all_tokens]
     song_joined = " ".join(song_canon)
 
@@ -225,8 +227,12 @@ def _score_url_against_query(
         if song_joined == q_joined
         else (1.0 if q_joined in song_joined or song_joined in q_joined else 0.0)
     )
+    artist_bonus = 0.0
+    if artist_canon and artist_slug_canon:
+        matched_a = sum(1 for at in artist_canon if at in artist_slug_canon)
+        artist_bonus = 0.9 * (matched_a / max(len(artist_canon), 1))
     slug_precision = sum(1 for st in song_canon if st in q_canon) / max(len(song_canon), 1)
-    score = coverage * 3.0 + slug_precision * 1.8 + exact_phrase_bonus
+    score = coverage * 3.0 + slug_precision * 1.8 + exact_phrase_bonus + artist_bonus
 
     if score < 2.2:
         return None
@@ -257,7 +263,7 @@ async def _search_geemansala_wp_api(
         return []
     out: List[Dict[str, str]] = []
     try:
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=BROWSER_HEADERS, verify=False) as client:
+        async with create_resilient_async_client(timeout=12.0, headers=BROWSER_HEADERS) as client:
             resp = await client.get(
                 "https://geemansala.com/wp-json/wp/v2/station",
                 params={"search": clean_q, "per_page": limit},
@@ -339,11 +345,11 @@ async def search_sri_lankan_song_urls(
         if "smule.com/song/" in low_url:
             raw_q = parse_smule_url_to_query(raw_q) or raw_q
 
-    combined_query = f"{raw_q} {artist_name}".strip()
+    primary_query = raw_q or artist_name.strip()
     latin_query = (
-        sinhala_to_singlish(combined_query)
-        if any(0x0D80 <= ord(c) <= 0x0DFF for c in combined_query)
-        else combined_query
+        sinhala_to_singlish(primary_query)
+        if any(0x0D80 <= ord(c) <= 0x0DFF for c in primary_query)
+        else primary_query
     )
     q_tokens = _normalize_latin_tokens(latin_query)
     if not q_tokens:
@@ -351,6 +357,17 @@ async def search_sri_lankan_song_urls(
 
     q_canon = [_canonical_singlish_word(t) for t in q_tokens]
     q_joined = " ".join(q_canon)
+
+    latin_artist = (
+        sinhala_to_singlish(artist_name.strip())
+        if artist_name.strip() and any(0x0D80 <= ord(c) <= 0x0DFF for c in artist_name)
+        else artist_name.strip()
+    )
+    artist_canon = (
+        [_canonical_singlish_word(t) for t in _normalize_latin_tokens(latin_artist)]
+        if latin_artist
+        else []
+    )
 
     scored: List[Tuple[float, Dict[str, str]]] = []
     seen_urls = set()
@@ -362,7 +379,7 @@ async def search_sri_lankan_song_urls(
             r"<loc>(https://www\.lyrihub\.lk/song/[^<]+)</loc>",
         )
         for u in lh_urls:
-            res = _score_url_against_query("lyrihub.lk", u, q_canon, q_joined)
+            res = _score_url_against_query("lyrihub.lk", u, q_canon, q_joined, artist_canon)
             if res and res[1]["url"] not in seen_urls:
                 seen_urls.add(res[1]["url"])
                 scored.append(res)
@@ -374,7 +391,7 @@ async def search_sri_lankan_song_urls(
             r"<loc>(https://lyrics-lk\.com/song/[^<]+)</loc>",
         )
         for u in ll_urls:
-            res = _score_url_against_query("lyrics-lk.com", u, q_canon, q_joined)
+            res = _score_url_against_query("lyrics-lk.com", u, q_canon, q_joined, artist_canon)
             if res and res[1]["url"] not in seen_urls:
                 seen_urls.add(res[1]["url"])
                 scored.append(res)
@@ -397,7 +414,7 @@ async def search_sri_lankan_song_urls(
             r"<loc>(https://geemansala\.com/songs/[^<]+)</loc>",
         )
         for u in gm_urls:
-            res = _score_url_against_query("geemansala.com", u, q_canon, q_joined)
+            res = _score_url_against_query("geemansala.com", u, q_canon, q_joined, artist_canon)
             if res and res[1]["url"] not in seen_urls:
                 seen_urls.add(res[1]["url"])
                 scored.append(res)
@@ -577,7 +594,7 @@ async def fetch_lyrics_from_url(url: str, source_hint: str = "") -> Optional[Dic
     if "smule.com" in low:
         # Check cleanly without bypassing access controls; Smule often returns HTTP 403
         try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=BROWSER_HEADERS, verify=False) as client:
+            async with create_resilient_async_client(timeout=10.0, headers=BROWSER_HEADERS) as client:
                 r = await client.get(url)
                 if r.status_code != 200:
                     logger.info("Smule returned HTTP %d (access restricted); using Sinhala hub fallback.", r.status_code)
@@ -607,7 +624,7 @@ async def fetch_lyrics_from_url(url: str, source_hint: str = "") -> Optional[Dic
             pass
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=BROWSER_HEADERS, verify=False) as client:
+        async with create_resilient_async_client(timeout=15.0, headers=BROWSER_HEADERS) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
                 return None

@@ -10,6 +10,8 @@ from fastapi import UploadFile
 import httpx
 import yt_dlp
 
+from backend.config import create_resilient_async_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -321,7 +323,7 @@ async def _fetch_tiktok_via_api_fallback(
         "Accept": "application/json, text/plain, */*",
     }
     try:
-        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, verify=False, headers=headers) as client:
+        async with create_resilient_async_client(timeout=25.0, headers=headers) as client:
             # If this is directly a TikTok `/music/...-<id>` link, handle it via our music-page fetcher
             direct_music_id = _extract_tiktok_music_id(tiktok_url)
             if direct_music_id:
@@ -645,12 +647,13 @@ async def get_media_duration(media_path: Path) -> float:
 
 async def identify_song_with_shazam_detailed(
     audio_path: Path,
-    timeout_sec: float = 12.0,
+    timeout_sec: float = 14.0,
 ) -> Optional[dict]:
     """
     Identify the exact Song Title, Artist, Full-Song Time Offset, Speed Skew, and embedded
     Shazam Lyrics directly from the audio waveform using Shazam audio fingerprinting.
-    Uses `httpx` (with `verify=False`) so macOS/Windows SSL certificate quirks never block Shazam.
+    Uses `httpx` with IPv4 preference + `verify=False` so macOS/Windows SSL certificate quirks
+    or dead IPv6 routes never block Shazam.
     """
     if not audio_path or not audio_path.exists():
         return None
@@ -666,7 +669,12 @@ async def identify_song_with_shazam_detailed(
                 proxy = kwargs.pop("proxy", None)
                 _ = proxy
                 resp = await self._client.request(method.upper(), url, **kwargs)
-                return resp.json()
+                if not resp.text or not resp.text.strip():
+                    return {}
+                try:
+                    return resp.json()
+                except Exception:
+                    return {}
 
             async def request_text(self, url: str, *, content_type: str, **kwargs) -> str:
                 kwargs.pop("proxy", None)
@@ -719,12 +727,15 @@ async def identify_song_with_shazam_detailed(
             }
 
         async def _run() -> Optional[dict]:
-            async with httpx.AsyncClient(timeout=8.0, verify=False, follow_redirects=True) as hx_client:
+            async with create_resilient_async_client(timeout=8.0) as hx_client:
                 shazam = Shazam(http_client=_HttpxShazamClient(hx_client))
-                res = await shazam.recognize(str(audio_path), max_skew=0.12)
-                parsed = _parse_shazam_response(res, slice_start_sec=0.0)
-                if parsed:
-                    return parsed
+                try:
+                    res = await shazam.recognize(str(audio_path), max_skew=0.12)
+                    parsed = _parse_shazam_response(res, slice_start_sec=0.0)
+                    if parsed:
+                        return parsed
+                except Exception as exc:
+                    logger.debug("Shazam initial clip attempt failed: %s", exc)
 
                 # If intro was instrumental/noisy, sample middle slice(s) of the clip
                 dur = await get_media_duration(audio_path)
@@ -759,6 +770,8 @@ async def identify_song_with_shazam_detailed(
                                 parsed2 = _parse_shazam_response(res2, slice_start_sec=slice_start)
                                 if parsed2:
                                     return parsed2
+                            except Exception as exc:
+                                logger.debug("Shazam slice attempt failed: %s", exc)
                             finally:
                                 mid_wav.unlink(missing_ok=True)
             return None

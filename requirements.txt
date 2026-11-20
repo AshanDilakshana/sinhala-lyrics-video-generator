@@ -24,6 +24,10 @@ aiohttp-retry>=2.8.3
 audioop-lts>=0.2.1; python_version >= "3.13"
 standard-aifc>=3.13.0; python_version >= "3.13"
 
-# Optional Local AI Word-Level Sinhala Phoneme Forced Aligner (Meta MMS CTC)
-# Install with: pip install torch ctc-forced-aligner
-# ctc-forced-aligner>=0.3.0
+# Local AI Vocal Separation & Word-Level Sinhala Phoneme Forced Alignment
+# Powered by Demucs (`htdemucs`) + Meta `torchaudio.pipelines.MMS_FA`
+torch>=2.5.0
+torchaudio>=2.5.0
+demucs>=4.0.1
+unidecode>=1.3.8
+huggingface-hub>=0.25.0

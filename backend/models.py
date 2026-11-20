@@ -66,7 +66,7 @@ class VideoEditConfig(BaseModel):
     font_family: str = Field(default="Sinhala Sangam MN", description="Font family name (system or custom TTF/OTF)")
     font_size: int = Field(default=40, ge=16, le=110)
     font_thickness: float = Field(default=0.0, ge=0.0, le=4.0, description="Extra stroke thickness (0 = original font weight)")
-    font_brightness: float = Field(default=1.0, ge=0.4, le=2.0, description="Font brightness & luminance glow multiplier (1.0 = normal, >1.0 = bright glow boost)")
+    font_brightness: float = Field(default=1.35, ge=0.4, le=2.0, description="Font brightness & luminance glow multiplier (1.0 = normal, >1.0 = bright glow boost)")
     primary_color_hex: str = Field(default="#FFFFFF", description="Hex text color e.g. #FFFFFF")
     outline_width: float = Field(default=1.8, ge=0.0, le=10.0)
     shadow_depth: float = Field(default=2.8, ge=0.0, le=10.0)
@@ -93,7 +93,7 @@ class VideoEditConfig(BaseModel):
     )
     video_zoom: float = Field(default=1.0, ge=1.0, le=1.6, description="Zoom factor (useful to crop out AI watermarks)")
     mirror_flip: bool = Field(default=False, description="Flip video horizontally (Mirror)")
-    brightness: float = Field(default=0.0, ge=-0.6, le=0.6, description="Video-only brightness adjustment (does not affect captions)")
+    brightness: float = Field(default=-0.3, ge=-0.6, le=0.6, description="Video-only brightness adjustment (does not affect captions)")
     contrast: float = Field(default=1.0, ge=0.5, le=1.8)
     saturation: float = Field(default=1.0, ge=0.0, le=2.2)
     vignette: bool = Field(default=False, description="Apply cinematic dark vignette around frame")
@@ -117,6 +117,7 @@ class LyricsResult(BaseModel):
     tier: LyricsSourceTier
     lines: List[LyricLine]
     raw_lrc: str
+    full_lyrics_text: Optional[str] = None
     detected_title: Optional[str] = None
     detected_artist: Optional[str] = None
     lyrics_source: Optional[str] = None

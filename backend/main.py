@@ -258,11 +258,11 @@ async def fetch_song_endpoint(
         final_title = lyrics_res.detected_title or resolved_title
         final_artist = lyrics_res.detected_artist or resolved_artist
 
-        # Prune stale song cache folders when count exceeds 20
+        # Prune stale song cache folders when count exceeds 20 (preserve draft_* bundles)
         try:
             cached_dirs = [
                 d for d in SONGS_CACHE_DIR.iterdir()
-                if d.is_dir() and d.name != song_id
+                if d.is_dir() and d.name != song_id and not d.name.startswith("draft_")
             ]
             if len(cached_dirs) > 20:
                 cached_dirs.sort(key=lambda d: d.stat().st_mtime)
@@ -280,7 +280,7 @@ async def fetch_song_endpoint(
             "raw_duration": round(raw_duration, 2),
             "audio_start_sec": round(safe_start_sec, 2),
             "audio_preview_url": f"/api/song-preview/{song_id}",
-            "fetched_lyrics": "\n".join(line.text for line in lyrics_res.lines),
+            "fetched_lyrics": lyrics_res.full_lyrics_text or "\n".join(line.text for line in lyrics_res.lines),
             "aligned_lines": [line.model_dump() for line in lyrics_res.lines],
             "lyrics_tier": lyrics_res.tier,
             "lyrics_source": lyrics_res.lyrics_source,
@@ -300,10 +300,11 @@ async def sync_lyrics_to_cached_song_endpoint(
     song_name: str = Form(default=""),
     artist_name: str = Form(default=""),
     language: str = Form(default="si"),
+    start_line_index: int = Form(default=-1),
 ):
     """
     Re-run the Sinhala Vocal-Formant + Breath-Dip Forced Aligner whenever the user edits
-    their Sinhala lyrics text in Track 4, without re-downloading the song!
+    their Sinhala lyrics text or selects the starting lyric line, without re-downloading the song!
     """
     safe_id = Path(cached_song_id).name
     song_dir = SONGS_CACHE_DIR / safe_id
@@ -329,12 +330,15 @@ async def sync_lyrics_to_cached_song_endpoint(
         manual_lyrics=manual_lyrics,
         language=language,
         raw_audio_path=raw_audio_path,
+        start_line_index=start_line_index,
+        force_refresh_asr=True,
     )
     return {
         "status": "ok",
         "duration": round(duration, 2),
         "title": lyrics_res.detected_title or song_name,
         "artist": lyrics_res.detected_artist or artist_name,
+        "fetched_lyrics": lyrics_res.full_lyrics_text or "\n".join(line.text for line in lyrics_res.lines),
         "aligned_lines": [line.model_dump() for line in lyrics_res.lines],
         "lrc_content": lyrics_res.raw_lrc,
         "lyrics_tier": lyrics_res.tier,
@@ -377,10 +381,10 @@ async def trim_cached_song_endpoint(
     )
     safe_max_dur = max(0.0, audio_max_duration_sec)
 
-    # Clear cached ASR window JSON files because the audio slice boundaries changed
-    for cache_json in song_dir.glob("asr_windows_*.json"):
+    # Clear cached ASR window JSON files and vocal-isolated WAVs because the audio slice boundaries changed
+    for stale_file in (*song_dir.glob("asr_windows_*.json"), song_dir / "vocal_isolated_ctc.wav", song_dir / "vocal_filtered_asr.wav"):
         try:
-            cache_json.unlink()
+            stale_file.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -421,7 +425,7 @@ async def trim_cached_song_endpoint(
         "raw_duration": round(raw_duration, 2),
         "audio_start_sec": round(safe_start_sec, 2),
         "audio_preview_url": f"/api/song-preview/{safe_id}?v={cache_bust}",
-        "fetched_lyrics": "\n".join(line.text for line in lyrics_res.lines),
+        "fetched_lyrics": lyrics_res.full_lyrics_text or "\n".join(line.text for line in lyrics_res.lines),
         "aligned_lines": [line.model_dump() for line in lyrics_res.lines],
         "lyrics_tier": lyrics_res.tier,
         "lyrics_source": lyrics_res.lyrics_source,
@@ -693,17 +697,21 @@ async def execute_video_pipeline(
             try:
                 raw_list = json.loads(custom_lines_json)
                 parsed_custom = [LyricLine(**item) for item in raw_list if item.get("text", "").strip()]
-                # Guard against stale custom_lines_json if manual_lyrics was changed afterwards
+                # Guard against stale custom_lines_json only if manual_lyrics was completely replaced
+                # with different lyrics text (mid-song slices & line edits stay valid!).
                 clean_manual_lines = [
                     l.strip()
                     for l in manual_lyrics.splitlines()
                     if l.strip() and not (l.strip().startswith("[") and l.strip().endswith("]"))
                 ]
                 custom_texts = [c.text.strip() for c in parsed_custom]
+                manual_set = set(clean_manual_lines)
+                overlap_count = sum(1 for t in custom_texts if t in manual_set)
                 is_stale = (
                     bool(clean_manual_lines)
-                    and len(clean_manual_lines) != len(custom_texts)
-                    and custom_texts != clean_manual_lines[: len(custom_texts)]
+                    and len(clean_manual_lines) >= 3
+                    and len(custom_texts) >= 2
+                    and overlap_count == 0
                 )
                 if parsed_custom and not is_stale:
                     lyrics_result = LyricsResult(
@@ -826,7 +834,36 @@ async def execute_video_pipeline(
             )
             if not draft_saved:
                 raise RuntimeError(f"Could not save draft video into '{DRAFTS_EXPORT_DIR}'.")
-            done_msg = f"Draft video saved to Downloads/{DOWNLOADS_EXPORT_DIR.name}/draft/{draft_saved.name}"
+
+            _save_draft_project_bundle(
+                job_id=job_id,
+                draft_mp4_path=draft_saved,
+                visual_clips=resolved_visual_clips,
+                master_audio_path=master_audio_path,
+                wav_audio_path=wav_audio_path,
+                song_source_path=song_source_path,
+                cached_song_id=cached_song_id,
+                song_url=song_url,
+                song_name=effective_export_title,
+                artist_name=artist_name or (lyrics_result.detected_artist if lyrics_result else "") or inferred_artist,
+                language=language,
+                manual_lyrics=(
+                    lyrics_result.full_lyrics_text
+                    if (lyrics_result and lyrics_result.full_lyrics_text)
+                    else manual_lyrics
+                ),
+                lyrics_result=lyrics_result,
+                total_duration=total_duration,
+                edit_config=edit_config,
+            )
+            if (
+                source_draft_filename
+                and source_draft_filename.strip()
+                and Path(source_draft_filename).name != draft_saved.name
+            ):
+                _delete_draft_file_if_exists(source_draft_filename)
+
+            done_msg = f"Draft video & project settings saved to Downloads/{DOWNLOADS_EXPORT_DIR.name}/draft/{draft_saved.name}"
             return _update_job(
                 job_id,
                 stage=JobStage.COMPLETED,
@@ -896,7 +933,7 @@ async def process_video_endpoint(
     font_family: str = Form(default="Sinhala Sangam MN"),
     font_size: int = Form(default=40),
     font_thickness: float = Form(default=0.0),
-    font_brightness: float = Form(default=1.0),
+    font_brightness: float = Form(default=1.35),
     primary_color_hex: str = Form(default="#FFFFFF"),
     outline_width: float = Form(default=1.8),
     shadow_depth: float = Form(default=2.8),
@@ -910,7 +947,7 @@ async def process_video_endpoint(
     loop_mode: LoopMode = Form(default=LoopMode.CROSSFADE),
     video_zoom: float = Form(default=1.0),
     mirror_flip: bool = Form(default=False),
-    brightness: float = Form(default=0.0),
+    brightness: float = Form(default=-0.3),
     contrast: float = Form(default=1.0),
     saturation: float = Form(default=1.0),
     vignette: bool = Form(default=False),
@@ -1171,12 +1208,113 @@ def _copy_render_to_downloads(src_path: Path, song_name: str, job_id: str) -> Op
     return _save_render_to_dir(src_path, DOWNLOADS_EXPORT_DIR, song_name, job_id, move=False)
 
 
+def _get_draft_projects_root() -> Path:
+    return (DRAFTS_EXPORT_DIR / ".draft_projects").resolve()
+
+
+def _save_draft_project_bundle(
+    job_id: str,
+    draft_mp4_path: Path,
+    visual_clips: List[Path],
+    master_audio_path: Path,
+    wav_audio_path: Path,
+    song_source_path: Optional[Path],
+    cached_song_id: Optional[str],
+    song_url: Optional[str],
+    song_name: str,
+    artist_name: str,
+    language: str,
+    manual_lyrics: str,
+    lyrics_result: LyricsResult,
+    total_duration: float,
+    edit_config: VideoEditConfig,
+) -> None:
+    """
+    Save all visual clips, song audio cache, synced lyrics timeline, and `VideoEditConfig`
+    settings alongside a Draft MP4 so the user can load the draft back into the editor,
+    re-edit any setting/lyrics/clips, and render to final!
+    """
+    try:
+        proj_dir = _get_draft_projects_root() / job_id
+        proj_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_clip_names: List[str] = []
+        for idx, clip_p in enumerate(visual_clips):
+            if clip_p and clip_p.exists():
+                ext = clip_p.suffix or ".mp4"
+                dest_clip = proj_dir / f"visual_clip_{idx:02d}{ext}"
+                shutil.copy2(clip_p, dest_clip)
+                saved_clip_names.append(dest_clip.name)
+
+        # Always store a dedicated durable audio copy in SONGS_CACHE_DIR / draft_<job_id>
+        # AND inside proj_dir so pruning can never break a saved Draft re-edit.
+        effective_song_id = f"draft_{job_id}"
+        song_cache_dir = SONGS_CACHE_DIR / effective_song_id
+        song_cache_dir.mkdir(parents=True, exist_ok=True)
+        raw_src = song_source_path
+        if cached_song_id and cached_song_id.strip():
+            prev_cache = SONGS_CACHE_DIR / Path(cached_song_id).name
+            raw_cands = sorted(prev_cache.glob("raw_song*")) if prev_cache.is_dir() else []
+            if raw_cands:
+                raw_src = raw_cands[0]
+        if master_audio_path and master_audio_path.exists():
+            shutil.copy2(master_audio_path, song_cache_dir / "extracted_audio.m4a")
+            shutil.copy2(master_audio_path, proj_dir / "extracted_audio.m4a")
+        if wav_audio_path and wav_audio_path.exists():
+            shutil.copy2(wav_audio_path, song_cache_dir / "extracted_audio.wav")
+        if raw_src and raw_src.exists():
+            raw_name = f"raw_song{raw_src.suffix or '.mp3'}"
+            shutil.copy2(raw_src, song_cache_dir / raw_name)
+            shutil.copy2(raw_src, proj_dir / raw_name)
+
+        project_payload = {
+            "job_id": job_id,
+            "draft_filename": draft_mp4_path.name,
+            "song_name": song_name,
+            "artist_name": artist_name,
+            "song_url": song_url or "",
+            "cached_song_id": effective_song_id,
+            "audio_preview_url": f"/api/song-preview/{effective_song_id}",
+            "duration": round(total_duration, 2),
+            "language": language,
+            "manual_lyrics": manual_lyrics or "\n".join(line.text for line in lyrics_result.lines),
+            "aligned_lines": [line.model_dump(mode="json") for line in lyrics_result.lines],
+            "lyrics_source": lyrics_result.lyrics_source or "",
+            "edit_config": edit_config.model_dump(mode="json"),
+            "visual_clip_files": saved_clip_names,
+        }
+        (proj_dir / "project.json").write_text(
+            json.dumps(project_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("Saved draft project bundle for '%s' in %s", draft_mp4_path.name, proj_dir)
+    except Exception as exc:
+        logger.warning("Failed to save draft project bundle for %s: %s", job_id, exc)
+
+
+def _delete_draft_project_bundle(draft_filename: str) -> None:
+    try:
+        jid = _extract_job_id_from_filename(draft_filename)
+        if not jid:
+            return
+        proj_dir = (_get_draft_projects_root() / jid).resolve()
+        if proj_dir.parent == _get_draft_projects_root() and proj_dir.is_dir():
+            shutil.rmtree(proj_dir, ignore_errors=True)
+            logger.info("Removed draft project bundle: %s", proj_dir)
+        draft_song_dir = (SONGS_CACHE_DIR / f"draft_{jid}").resolve()
+        if draft_song_dir.parent == SONGS_CACHE_DIR.resolve() and draft_song_dir.is_dir():
+            shutil.rmtree(draft_song_dir, ignore_errors=True)
+    except Exception as exc:
+        logger.debug("Could not remove draft project bundle for %s: %s", draft_filename, exc)
+
+
 def _delete_draft_file_if_exists(draft_filename: str) -> Optional[str]:
-    """Remove a draft MP4 from `DRAFTS_EXPORT_DIR` after it has been finalized/rendered."""
+    """Remove a draft MP4 (and its saved draft project bundle) from `DRAFTS_EXPORT_DIR` after final render."""
     try:
         safe_name = Path(draft_filename).name
         if not safe_name:
             return None
+        _delete_draft_project_bundle(safe_name)
         draft_root = DRAFTS_EXPORT_DIR.resolve()
         candidate = (draft_root / safe_name).resolve()
         if candidate.parent == draft_root and candidate.is_file():
@@ -1260,9 +1398,11 @@ def _list_rendered_videos_sync() -> List[Dict[str, Any]]:
             )
 
     if DRAFTS_EXPORT_DIR.exists():
+        proj_root = _get_draft_projects_root()
         for mp4 in sorted(DRAFTS_EXPORT_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
             jid = _extract_job_id_from_filename(mp4.name)
             st = mp4.stat()
+            has_proj = bool(jid and (proj_root / jid / "project.json").is_file())
             items.append(
                 {
                     "id": f"draft:{mp4.name}",
@@ -1270,6 +1410,7 @@ def _list_rendered_videos_sync() -> List[Dict[str, Any]]:
                     "job_id": jid,
                     "location": "draft",
                     "is_draft": True,
+                    "has_project_state": has_proj,
                     "size_mb": round(st.st_size / (1024 * 1024), 2),
                     "created_at": st.st_mtime,
                     "created_label": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
@@ -1311,6 +1452,91 @@ async def serve_rendered_video_file(location: str, filename: str, download: int 
     )
 
 
+@app.get("/api/rendered-videos/draft/{filename}/project")
+async def get_draft_project_state(filename: str):
+    """
+    Load the saved project settings, synced lyrics timeline, song audio preview, and
+    visual clip URLs for a draft video so the user can re-edit it and render to final.
+    """
+    draft_root = DRAFTS_EXPORT_DIR.resolve()
+    safe_name = Path(filename).name
+    safe_file = (draft_root / safe_name).resolve()
+    if not safe_file.exists() or safe_file.parent != draft_root:
+        raise HTTPException(status_code=404, detail="Draft video file not found.")
+
+    jid = _extract_job_id_from_filename(safe_name)
+    proj_file = (_get_draft_projects_root() / jid / "project.json") if jid else None
+
+    if proj_file and proj_file.is_file():
+        data = json.loads(proj_file.read_text(encoding="utf-8"))
+        # Ensure cached song directory exists for previewing & trimming during re-edit
+        c_song_id = Path(str(data.get("cached_song_id") or f"draft_{jid}")).name
+        target_song_dir = SONGS_CACHE_DIR / c_song_id
+        proj_parent = proj_file.parent
+        if not (target_song_dir / "extracted_audio.m4a").is_file() and (proj_parent / "extracted_audio.m4a").is_file():
+            target_song_dir.mkdir(parents=True, exist_ok=True)
+            for fname in ("extracted_audio.m4a",):
+                src_a = proj_parent / fname
+                if src_a.is_file():
+                    shutil.copy2(src_a, target_song_dir / fname)
+            for raw_f in proj_parent.glob("raw_song*"):
+                if raw_f.is_file():
+                    shutil.copy2(raw_f, target_song_dir / raw_f.name)
+            data["cached_song_id"] = c_song_id
+            data["audio_preview_url"] = f"/api/song-preview/{c_song_id}"
+        clip_files = data.get("visual_clip_files") or []
+        data["visual_clip_urls"] = [
+            {
+                "url": f"/api/rendered-videos/draft/{quote(safe_name)}/clip/{idx}",
+                "filename": cname,
+            }
+            for idx, cname in enumerate(clip_files)
+        ]
+        data["draft_filename"] = safe_name
+        return data
+
+    # Fallback for older draft MP4s saved before project bundles were introduced
+    job_info = JOBS.get(jid) if jid else None
+    clean_title = re.sub(r"\s*\([a-f0-9]{12}\)\.mp4$", "", safe_name, flags=re.IGNORECASE).strip()
+    return {
+        "job_id": jid,
+        "draft_filename": safe_name,
+        "song_name": (job_info.detected_title if job_info and job_info.detected_title else clean_title),
+        "artist_name": (job_info.detected_artist if job_info and job_info.detected_artist else ""),
+        "song_url": "",
+        "cached_song_id": "",
+        "audio_preview_url": "",
+        "duration": (job_info.song_duration if job_info and job_info.song_duration else 0.0),
+        "language": "si",
+        "manual_lyrics": "\n".join(l.text for l in (job_info.lyrics_preview or [])) if job_info else "",
+        "aligned_lines": [l.model_dump(mode="json") for l in (job_info.lyrics_preview or [])] if job_info else [],
+        "lyrics_source": (job_info.lyrics_source if job_info and job_info.lyrics_source else ""),
+        "edit_config": None,
+        "visual_clip_urls": [],
+    }
+
+
+@app.get("/api/rendered-videos/draft/{filename}/clip/{clip_idx}")
+async def serve_draft_project_visual_clip(filename: str, clip_idx: int):
+    """Stream a saved visual clip from a draft project bundle for re-editing."""
+    safe_name = Path(filename).name
+    jid = _extract_job_id_from_filename(safe_name)
+    if not jid:
+        raise HTTPException(status_code=404, detail="Invalid draft filename.")
+    proj_dir = (_get_draft_projects_root() / jid).resolve()
+    proj_file = proj_dir / "project.json"
+    if not proj_file.is_file():
+        raise HTTPException(status_code=404, detail="Draft project bundle not found.")
+    data = json.loads(proj_file.read_text(encoding="utf-8"))
+    clip_files = data.get("visual_clip_files") or []
+    if clip_idx < 0 or clip_idx >= len(clip_files):
+        raise HTTPException(status_code=404, detail="Draft visual clip index out of range.")
+    clip_path = (proj_dir / Path(clip_files[clip_idx]).name).resolve()
+    if not clip_path.is_file() or clip_path.parent != proj_dir:
+        raise HTTPException(status_code=404, detail="Draft visual clip file missing.")
+    return FileResponse(path=str(clip_path), media_type="video/mp4", filename=clip_path.name)
+
+
 @app.post("/api/rendered-videos/draft/{filename}/render")
 async def render_draft_to_final_folder(filename: str):
     """
@@ -1330,6 +1556,7 @@ async def render_draft_to_final_folder(filename: str):
         dest_path = DOWNLOADS_EXPORT_DIR / f"{stem}_{uuid.uuid4().hex[:6]}{suffix}"
 
     await asyncio.to_thread(shutil.move, str(safe_file), str(dest_path))
+    _delete_draft_project_bundle(safe_file.name)
     logger.info("Promoted draft video '%s' -> '%s'", safe_file.name, dest_path)
 
     return {
@@ -1351,6 +1578,8 @@ async def delete_rendered_video_file(location: str, filename: str):
         raise HTTPException(status_code=404, detail="Rendered video file not found.")
     jid = _extract_job_id_from_filename(safe_file.name)
     safe_file.unlink(missing_ok=True)
+    if location == "draft":
+        _delete_draft_project_bundle(safe_file.name)
     # Only clean matching copy across downloads/outputs for final videos (not draft deletes)
     if jid and location != "draft":
         for other_dir in (OUTPUT_DIR, DOWNLOADS_EXPORT_DIR):

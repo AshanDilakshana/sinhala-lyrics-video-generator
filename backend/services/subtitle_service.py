@@ -83,6 +83,7 @@ def _build_progressive_word_fade_line(
     line: LyricLine,
     pos_tag: str = "",
     text_transform: Optional[Callable[[str], str]] = None,
+    target_alpha_hex: str = "00",
 ) -> str:
     """
     Replicates the The_Black Hart word-by-word progressive opacity reveal:
@@ -92,21 +93,23 @@ def _build_progressive_word_fade_line(
     duration_ms = max(int(round((line.end - line.start) * 1000)), 400)
     fade_out_ms = min(240, duration_ms // 4)
     transform = text_transform or (lambda s: s)
+    alpha_tag = f"&H{target_alpha_hex}&"
 
     # Use acoustic word-level onset timings if computed by the vocal aligner
     if line.words and len(line.words) > 1:
         parts: List[str] = []
+        max_reveal_end = max(140, duration_ms - fade_out_ms)
         for idx, wt in enumerate(line.words):
             safe_word = _escape_ass_text(transform(wt.word))
-            t_start = max(0, wt.start_ms)
-            t_end = max(t_start + 100, min(wt.end_ms, duration_ms - fade_out_ms))
+            t_start = max(0, min(wt.start_ms, max(0, max_reveal_end - 110)))
+            t_end = max(t_start + 100, min(wt.end_ms, max_reveal_end))
             if idx == 0:
                 parts.append(
-                    rf"{{{pos_tag}\fad(0,{fade_out_ms})\alpha&HFF&\t({t_start},{t_end},\alpha&H00&)}}{safe_word}"
+                    rf"{{{pos_tag}\fad(0,{fade_out_ms})\alpha&HFF&\t({t_start},{t_end},\alpha{alpha_tag})}}{safe_word}"
                 )
             else:
                 parts.append(
-                    rf"{{\alpha&HFF&\t({t_start},{t_end},\alpha&H00&)}}{safe_word}"
+                    rf"{{\alpha&HFF&\t({t_start},{t_end},\alpha{alpha_tag})}}{safe_word}"
                 )
         return " ".join(parts)
 
@@ -126,11 +129,11 @@ def _build_progressive_word_fade_line(
         t_end = min(t_start + word_fade_dur, duration_ms - fade_out_ms)
         if idx == 0:
             parts.append(
-                rf"{{{pos_tag}\fad(0,{fade_out_ms})\alpha&HFF&\t(0,{t_end},\alpha&H00&)}}{safe_word}"
+                rf"{{{pos_tag}\fad(0,{fade_out_ms})\alpha&HFF&\t(0,{t_end},\alpha{alpha_tag})}}{safe_word}"
             )
         else:
             parts.append(
-                rf"{{\alpha&HFF&\t({t_start},{t_end},\alpha&H00&)}}{safe_word}"
+                rf"{{\alpha&HFF&\t({t_start},{t_end},\alpha{alpha_tag})}}{safe_word}"
             )
 
     return " ".join(parts)
@@ -239,11 +242,12 @@ def generate_ass_subtitles(
 
     use_glow_layer = font_brightness > 1.02
     glow_blur = 0.0
+    glow_alpha_hex = "C8"
     if use_glow_layer:
         boost = min(1.0, font_brightness - 1.0)
-        glow_outline_w = round(2.2 + boost * 5.5 + extra_thick, 2)
-        glow_blur = round(2.0 + boost * 4.5, 1)
-        glow_alpha_int = int(round(max(45, 195 - boost * 145)))
+        glow_outline_w = round(0.9 + boost * 1.6 + extra_thick * 0.4, 2)
+        glow_blur = round(4.0 + boost * 5.0, 1)
+        glow_alpha_int = int(round(max(155, 228 - boost * 65)))
         glow_alpha_hex = f"{glow_alpha_int:02X}"
         glow_color = _hex_to_ass_color(bright_primary_hex, glow_alpha_hex)
         glow_style_line = (
@@ -297,7 +301,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
             glow_text = (
                 _build_progressive_word_fade_line(
-                    line, pos_tag=rf"{pos_tag}\blur{glow_blur}", text_transform=_transform_lyric_text
+                    line,
+                    pos_tag=rf"{pos_tag}\blur{glow_blur}",
+                    text_transform=_transform_lyric_text,
+                    target_alpha_hex=glow_alpha_hex,
                 )
                 if use_glow_layer
                 else ""

@@ -341,6 +341,7 @@ interface RenderedVideoItem {
   job_id: string;
   location: "downloads" | "outputs" | "draft";
   is_draft?: boolean;
+  has_project_state?: boolean;
   size_mb: number;
   created_at: number;
   created_label: string;
@@ -389,14 +390,14 @@ interface LyricLine {
 interface JobStatusResponse {
   job_id: string;
   stage:
-    | "queued"
-    | "extracting_media"
-    | "fetching_lyrics"
-    | "aligning_audio"
-    | "generating_subtitles"
-    | "rendering_video"
-    | "completed"
-    | "failed";
+  | "queued"
+  | "extracting_media"
+  | "fetching_lyrics"
+  | "aligning_audio"
+  | "generating_subtitles"
+  | "rendering_video"
+  | "completed"
+  | "failed";
   progress: number;
   message: string;
   is_draft?: boolean;
@@ -574,6 +575,8 @@ export default function TikTokLyricsVideoEditor() {
   // 1. Visual Track State (AI Animated Video Clips)
   const [visualClips, setVisualClips] = useState<File[]>([]);
   const [previewClipUrl, setPreviewClipUrl] = useState<string | null>(null);
+  const [clipPreviewUrls, setClipPreviewUrls] = useState<string[]>([]);
+  const [selectedSingleClipIdx, setSelectedSingleClipIdx] = useState<number | null>(null);
   const [detectedClipDuration, setDetectedClipDuration] = useState<number>(0);
 
   // 2. Simple Video Editing Tools State
@@ -586,7 +589,7 @@ export default function TikTokLyricsVideoEditor() {
   const [loopMode, setLoopMode] = useState<LoopMode>("crossfade");
   const [videoZoom, setVideoZoom] = useState<number>(1.0);
   const [mirrorFlip, setMirrorFlip] = useState<boolean>(false);
-  const [brightness, setBrightness] = useState<number>(0.0);
+  const [brightness, setBrightness] = useState<number>(-0.3);
   const [contrast, setContrast] = useState<number>(1.0);
   const [saturation, setSaturation] = useState<number>(1.0);
   const [vignette, setVignette] = useState<boolean>(false);
@@ -621,6 +624,7 @@ export default function TikTokLyricsVideoEditor() {
   // 4. Lyrics & Metadata State (Defaults to Auto-Caption mode with empty manualLyrics)
   const [captionMode, setCaptionMode] = useState<"auto" | "manual">("auto");
   const [audioTabLyricsView, setAudioTabLyricsView] = useState<"synced" | "text">("synced");
+  const [isEditingFullLyricsText, setIsEditingFullLyricsText] = useState<boolean>(false);
   const [songName, setSongName] = useState<string>("");
   const [artistName, setArtistName] = useState<string>("");
   const [manualLyrics, setManualLyrics] = useState<string>("");
@@ -763,6 +767,7 @@ export default function TikTokLyricsVideoEditor() {
     "~/Downloads/Titok video meker/draft"
   );
   const [activeDraftFilename, setActiveDraftFilename] = useState<string | null>(null);
+  const [loadingDraftFilename, setLoadingDraftFilename] = useState<string | null>(null);
   const [videoLibraryFilter, setVideoLibraryFilter] = useState<"all" | "final" | "draft">("all");
   const [promotingDraftFilename, setPromotingDraftFilename] = useState<string | null>(null);
   const [isLoadingRenderedVideos, setIsLoadingRenderedVideos] = useState<boolean>(false);
@@ -781,7 +786,8 @@ export default function TikTokLyricsVideoEditor() {
 
   const [fontSize, setFontSize] = useState<number>(40);
   const [fontThickness, setFontThickness] = useState<number>(0);
-  const [fontBrightness, setFontBrightness] = useState<number>(1.0);
+  const [fontBrightness, setFontBrightness] = useState<number>(1.35);
+  const [selectedStartLineIdx, setSelectedStartLineIdx] = useState<number>(-1);
   const [primaryColorHex, setPrimaryColorHex] = useState<string>("#FFFFFF");
   const [outlineWidth, setOutlineWidth] = useState<number>(1.8);
   const [shadowDepth, setShadowDepth] = useState<number>(2.8);
@@ -965,13 +971,13 @@ export default function TikTokLyricsVideoEditor() {
       setJob((prev) =>
         prev && prev.output_filename === video.filename
           ? {
-              ...prev,
-              is_draft: false,
-              promoted_from_draft: video.filename,
-              output_filename: data.filename || video.filename,
-              video_url: data.stream_url || prev.video_url,
-              message: `Rendered & moved '${video.filename}' from draft to original folder!`,
-            }
+            ...prev,
+            is_draft: false,
+            promoted_from_draft: video.filename,
+            output_filename: data.filename || video.filename,
+            video_url: data.stream_url || prev.video_url,
+            message: `Rendered & moved '${video.filename}' from draft to original folder!`,
+          }
           : prev
       );
       await fetchRenderedVideos();
@@ -980,6 +986,176 @@ export default function TikTokLyricsVideoEditor() {
       showToast(`Failed to render draft: ${err.message || "Unknown error"}`);
     } finally {
       setPromotingDraftFilename(null);
+    }
+  };
+
+  const handleLoadDraftForReEdit = async (video: RenderedVideoItem) => {
+    setLoadingDraftFilename(video.filename);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/rendered-videos/draft/${encodeURIComponent(video.filename)}/project`
+      );
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(
+          errData.detail ||
+          "Draft project settings not found (re-save the draft once to store its project bundle)."
+        );
+      }
+      const data = await res.json();
+      const cfg = data.edit_config || {};
+
+      // Restore visual video clips from the draft bundle
+      const rawClipEntries = Array.isArray(data.visual_clip_urls) ? data.visual_clip_urls : [];
+      const loadedFiles: File[] = [];
+      for (let i = 0; i < rawClipEntries.length; i++) {
+        const entry = rawClipEntries[i];
+        const relUrl = typeof entry === "string" ? entry : entry?.url;
+        const clipFilename =
+          (typeof entry === "object" && entry?.filename) || `draft_clip_${i + 1}.mp4`;
+        if (!relUrl) continue;
+        try {
+          const clipRes = await fetch(`${API_BASE}${relUrl}`);
+          if (clipRes.ok) {
+            const blob = await clipRes.blob();
+            loadedFiles.push(
+              new File([blob], clipFilename, {
+                type: blob.type || "video/mp4",
+              })
+            );
+          }
+        } catch {
+          // ignore single clip fetch errors
+        }
+      }
+      if (loadedFiles.length > 0) {
+        userModifiedMediaRef.current = true;
+        setVisualClips(loadedFiles);
+      } else {
+        userModifiedMediaRef.current = true;
+        setVisualClips([]);
+      }
+      setSelectedSingleClipIdx(null);
+      setSelectedStartLineIdx(-1);
+
+      // Restore song & lyrics timeline
+      if (typeof data.song_name === "string") setSongName(data.song_name);
+      if (typeof data.artist_name === "string") setArtistName(data.artist_name);
+      if (typeof data.song_url === "string") {
+        setSongUrl(data.song_url);
+        setSongSourceMode(data.song_url.trim() ? "url" : "upload");
+      }
+      if (typeof data.language === "string") setLanguage(data.language);
+      if (typeof data.lyrics_source === "string") {
+        setDetectedLyricsSource(data.lyrics_source || null);
+      }
+      if (typeof data.manual_lyrics === "string") {
+        setManualLyrics(data.manual_lyrics);
+        if (data.manual_lyrics.trim()) {
+          setCaptionMode("manual");
+        }
+      }
+      if (Array.isArray(data.aligned_lines) && data.aligned_lines.length > 0) {
+        setEditableTimeline(data.aligned_lines);
+        setSelectedCaptionIdx(0);
+      } else {
+        setEditableTimeline([]);
+      }
+      const restoredDur =
+        typeof data.duration === "number" && data.duration > 0
+          ? data.duration
+          : typeof data.song_duration === "number" && data.song_duration > 0
+          ? data.song_duration
+          : null;
+      if (restoredDur !== null) {
+        setFetchedSongDuration(restoredDur);
+        setRawSongDuration(restoredDur);
+      }
+      const previewPath = data.audio_preview_url || data.song_preview_url;
+      if (typeof data.cached_song_id === "string" && data.cached_song_id) {
+        setCachedSongId(data.cached_song_id);
+        setSongPreviewUrl(
+          previewPath
+            ? `${API_BASE}${previewPath}`
+            : `${API_BASE}/api/song-preview/${data.cached_song_id}`
+        );
+      }
+
+      // Restore all VideoEditConfig settings
+      if (typeof cfg.frame_layout === "string") setFrameLayout(cfg.frame_layout as FrameLayout);
+      if (typeof cfg.color_grade === "string") setColorGrade(cfg.color_grade as ColorGradePreset);
+      if (typeof cfg.style_preset === "string") setStylePreset(cfg.style_preset as StylePreset);
+      if (typeof cfg.font_family === "string") setSelectedFontFamily(cfg.font_family);
+      if (typeof cfg.font_size === "number") setFontSize(cfg.font_size);
+      if (typeof cfg.font_thickness === "number") setFontThickness(cfg.font_thickness);
+      if (typeof cfg.font_brightness === "number") setFontBrightness(cfg.font_brightness);
+      if (typeof cfg.primary_color_hex === "string") setPrimaryColorHex(cfg.primary_color_hex);
+      if (typeof cfg.outline_width === "number") setOutlineWidth(cfg.outline_width);
+      if (typeof cfg.shadow_depth === "number") setShadowDepth(cfg.shadow_depth);
+      if (typeof cfg.text_pos_y_percent === "number") setTextPosYPercent(cfg.text_pos_y_percent);
+      if (typeof cfg.bold_text === "boolean") setBoldText(cfg.bold_text);
+      if (typeof cfg.italic_text === "boolean") setItalicText(cfg.italic_text);
+      if (typeof cfg.lyrics_offset_sec === "number") setLyricsOffsetSec(cfg.lyrics_offset_sec);
+      if (typeof cfg.clip_trim_start === "number") setClipTrimStart(cfg.clip_trim_start);
+      if (typeof cfg.clip_trim_end === "number") setClipTrimEnd(cfg.clip_trim_end);
+      if (typeof cfg.clip_segments_json === "string" && cfg.clip_segments_json.trim()) {
+        try {
+          const parsedSegs = JSON.parse(cfg.clip_segments_json);
+          if (Array.isArray(parsedSegs)) setVideoSegments(parsedSegs);
+        } catch {
+          setVideoSegments([]);
+        }
+      } else {
+        setVideoSegments([]);
+      }
+      if (typeof cfg.loop_mode === "string") setLoopMode(cfg.loop_mode as LoopMode);
+      if (typeof cfg.video_zoom === "number") setVideoZoom(cfg.video_zoom);
+      if (typeof cfg.mirror_flip === "boolean") setMirrorFlip(cfg.mirror_flip);
+      if (typeof cfg.brightness === "number") setBrightness(cfg.brightness);
+      if (typeof cfg.contrast === "number") setContrast(cfg.contrast);
+      if (typeof cfg.saturation === "number") setSaturation(cfg.saturation);
+      if (typeof cfg.vignette === "boolean") setVignette(cfg.vignette);
+      if (typeof cfg.blur_transition_interval === "number") {
+        setBlurInterval(cfg.blur_transition_interval);
+      }
+      if (typeof cfg.clip_speed === "number") setClipSpeed(cfg.clip_speed);
+      if (typeof cfg.corner_radius === "number") setCornerRadius(cfg.corner_radius);
+      if (typeof cfg.watermark_text === "string") setWatermarkText(cfg.watermark_text);
+      if (typeof cfg.watermark_size === "number") setWatermarkSize(cfg.watermark_size);
+      if (typeof cfg.watermark_pos_x_percent === "number") {
+        setWatermarkPosXPercent(cfg.watermark_pos_x_percent);
+      }
+      if (typeof cfg.watermark_pos_y_percent === "number") {
+        setWatermarkPosYPercent(cfg.watermark_pos_y_percent);
+      }
+      if (typeof cfg.audio_start_sec === "number") {
+        setAudioStartSec(cfg.audio_start_sec);
+        setAppliedAudioStartSec(cfg.audio_start_sec);
+        setAudioStartText(formatMmSs(cfg.audio_start_sec));
+      }
+      if (typeof cfg.audio_max_duration_sec === "number") {
+        setAudioMaxDurationSec(cfg.audio_max_duration_sec);
+      }
+      if (typeof cfg.fade_in_out === "boolean") setFadeInOut(cfg.fade_in_out);
+      if (typeof cfg.audio_fade === "boolean") setAudioFade(cfg.audio_fade);
+
+      undoPastRef.current = [];
+      undoFutureRef.current = [];
+      committedUndoJsonRef.current = null;
+      setUndoCount(0);
+      setRedoCount(0);
+      setActiveDraftFilename(video.filename);
+      setActivePreviewTab("canvas");
+      setActiveSidebarTab(loadedFiles.length > 0 ? "captions" : "media");
+      showToast(
+        loadedFiles.length > 0
+          ? `✏️ Loaded draft "${video.filename}" for re-editing! Click "Render Video" when ready to save to Render folder.`
+          : `✏️ Loaded draft settings for "${video.filename}"! Please add a video clip in Media tab before rendering.`
+      );
+    } catch (err: any) {
+      showToast(`Could not load draft project: ${err.message || "Unknown error"}`);
+    } finally {
+      setLoadingDraftFilename(null);
     }
   };
 
@@ -1095,7 +1271,11 @@ export default function TikTokLyricsVideoEditor() {
           if (typeof s.loopMode === "string") setLoopMode(s.loopMode);
           if (typeof s.videoZoom === "number") setVideoZoom(s.videoZoom);
           if (typeof s.mirrorFlip === "boolean") setMirrorFlip(s.mirrorFlip);
-          if (typeof s.brightness === "number") setBrightness(s.brightness);
+          if (s.defaultsVersion === 2 && typeof s.brightness === "number") {
+            setBrightness(s.brightness);
+          } else {
+            setBrightness(-0.3);
+          }
           if (typeof s.contrast === "number") setContrast(s.contrast);
           if (typeof s.saturation === "number") setSaturation(s.saturation);
           if (typeof s.vignette === "boolean") setVignette(s.vignette);
@@ -1135,7 +1315,11 @@ export default function TikTokLyricsVideoEditor() {
           }
           if (typeof s.fontSize === "number") setFontSize(s.fontSize);
           if (typeof s.fontThickness === "number") setFontThickness(s.fontThickness);
-          if (typeof s.fontBrightness === "number") setFontBrightness(s.fontBrightness);
+          if (s.defaultsVersion === 2 && typeof s.fontBrightness === "number") {
+            setFontBrightness(s.fontBrightness);
+          } else {
+            setFontBrightness(1.35);
+          }
           if (typeof s.primaryColorHex === "string") setPrimaryColorHex(s.primaryColorHex);
           if (typeof s.outlineWidth === "number") setOutlineWidth(s.outlineWidth);
           if (typeof s.shadowDepth === "number") setShadowDepth(s.shadowDepth);
@@ -1177,7 +1361,7 @@ export default function TikTokLyricsVideoEditor() {
                   setSongPreviewUrl(null);
                 }
               })
-              .catch(() => {});
+              .catch(() => { });
           }
 
           if (s.job && typeof s.job === "object" && typeof s.job.job_id === "string") {
@@ -1191,7 +1375,7 @@ export default function TikTokLyricsVideoEditor() {
                   setJob(null);
                 }
               })
-              .catch(() => {});
+              .catch(() => { });
           }
         }
       }
@@ -1224,6 +1408,7 @@ export default function TikTokLyricsVideoEditor() {
   useEffect(() => {
     if (!isProjectHydrated) return;
     const payload = {
+      defaultsVersion: 2,
       activeSidebarTab,
       timelineViewMode,
       timelineZoom,
@@ -1421,7 +1606,7 @@ export default function TikTokLyricsVideoEditor() {
       setLoopMode(s.loopMode ?? "crossfade");
       setVideoZoom(s.videoZoom ?? 1.0);
       setMirrorFlip(Boolean(s.mirrorFlip));
-      setBrightness(s.brightness ?? 0.0);
+      setBrightness(s.brightness ?? -0.3);
       setContrast(s.contrast ?? 1.0);
       setSaturation(s.saturation ?? 1.0);
       setVignette(Boolean(s.vignette));
@@ -1434,12 +1619,12 @@ export default function TikTokLyricsVideoEditor() {
       setSongName(s.songName ?? "");
       setArtistName(s.artistName ?? "");
       setManualLyrics(s.manualLyrics ?? "");
-      setLanguage(s.language ?? "si-LK");
+      setLanguage(s.language ?? "si");
       setEditableTimeline(Array.isArray(s.editableTimeline) ? s.editableTimeline : []);
       setSelectedFontFamily(s.selectedFontFamily ?? defaultFontFamily);
       setFontSize(s.fontSize ?? 40);
       setFontThickness(s.fontThickness ?? 0);
-      setFontBrightness(s.fontBrightness ?? 1.0);
+      setFontBrightness(s.fontBrightness ?? 1.35);
       setPrimaryColorHex(s.primaryColorHex ?? "#FFFFFF");
       setOutlineWidth(s.outlineWidth ?? 1.8);
       setShadowDepth(s.shadowDepth ?? 2.8);
@@ -1614,8 +1799,11 @@ export default function TikTokLyricsVideoEditor() {
     await clearPersistedProject();
     userModifiedMediaRef.current = true;
     setVisualClips([]);
+    setClipPreviewUrls([]);
+    setSelectedSingleClipIdx(null);
     setPreviewClipUrl(null);
     setDetectedClipDuration(0);
+    setIsEditingFullLyricsText(false);
     setClipSpeed(1.0);
     setClipTrimStart(0);
     setClipTrimEnd(0);
@@ -1625,8 +1813,9 @@ export default function TikTokLyricsVideoEditor() {
     setLoopMode("crossfade");
     setVideoZoom(1.0);
     setMirrorFlip(false);
-    setBrightness(0.0);
-    setFontBrightness(1.0);
+    setBrightness(-0.3);
+    setFontBrightness(1.35);
+    setSelectedStartLineIdx(-1);
     setContrast(1.0);
     setSaturation(1.0);
     setVignette(false);
@@ -1734,14 +1923,54 @@ export default function TikTokLyricsVideoEditor() {
 
   useEffect(() => {
     if (visualClips.length > 0) {
-      const url = URL.createObjectURL(visualClips[0]);
-      setPreviewClipUrl(url);
-      return () => URL.revokeObjectURL(url);
+      const urls = visualClips.map((c) => URL.createObjectURL(c));
+      setClipPreviewUrls(urls);
+      return () => {
+        urls.forEach((u) => URL.revokeObjectURL(u));
+      };
     } else {
+      setClipPreviewUrls([]);
       setPreviewClipUrl(null);
+      setSelectedSingleClipIdx(null);
       setDetectedClipDuration(0);
     }
   }, [visualClips]);
+
+  // Keep selectedSingleClipIdx valid when clips are removed and compute active previewClipUrl
+  useEffect(() => {
+    if (
+      selectedSingleClipIdx !== null &&
+      (selectedSingleClipIdx < 0 || selectedSingleClipIdx >= visualClips.length)
+    ) {
+      setSelectedSingleClipIdx(null);
+      return;
+    }
+    if (clipPreviewUrls.length === 0) {
+      setPreviewClipUrl(null);
+      return;
+    }
+    if (selectedSingleClipIdx !== null && clipPreviewUrls[selectedSingleClipIdx]) {
+      setPreviewClipUrl(clipPreviewUrls[selectedSingleClipIdx]);
+      return;
+    }
+    if (clipPreviewUrls.length === 1) {
+      setPreviewClipUrl(clipPreviewUrls[0]);
+      return;
+    }
+    // Mix & Blend All Clips mode across the song timeline
+    const songDur = Math.max(12, fetchedSongDuration || 30);
+    const slotDur = Math.max(3.5, songDur / clipPreviewUrls.length);
+    const activeSlot =
+      Math.floor(Math.max(0, currentAudioTime) / slotDur) % clipPreviewUrls.length;
+    const nextUrl = clipPreviewUrls[activeSlot] || clipPreviewUrls[0];
+    setPreviewClipUrl((prev) => (prev === nextUrl ? prev : nextUrl));
+  }, [
+    clipPreviewUrls,
+    selectedSingleClipIdx,
+    currentAudioTime,
+    fetchedSongDuration,
+    visualClips.length,
+  ]);
 
   // Cycle through preview lines when song audio is NOT actively playing
   useEffect(() => {
@@ -1750,9 +1979,9 @@ export default function TikTokLyricsVideoEditor() {
       editableTimeline.length > 0
         ? editableTimeline.map((l) => l.text)
         : manualLyrics
-            .split("\n")
-            .map((l) => l.trim())
-            .filter(Boolean);
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
     if (lines.length === 0) return;
     const timer = setInterval(() => {
       setPreviewLineIndex((prev) => (prev + 1) % lines.length);
@@ -1843,7 +2072,7 @@ export default function TikTokLyricsVideoEditor() {
           Math.max(12, Math.min(96, Math.round((v / maxPeak) * 92)))
         );
         if (!cancelled) setWaveformBars(normalized);
-        ctx.close().catch(() => {});
+        ctx.close().catch(() => { });
       } catch {
         // Fallback smoothly to deterministic ambient wave when browser decode fails
       }
@@ -2016,6 +2245,7 @@ export default function TikTokLyricsVideoEditor() {
         setEditableTimeline(data.aligned_lines);
         setSelectedCaptionIdx(0);
       }
+      setSelectedStartLineIdx(-1);
       if (typeof data.fetched_lyrics === "string" && data.fetched_lyrics.trim()) {
         setManualLyrics(data.fetched_lyrics);
       }
@@ -2023,11 +2253,10 @@ export default function TikTokLyricsVideoEditor() {
       const sourceInfo = data.lyrics_source
         ? `via ${data.lyrics_source}`
         : activeMode === "auto"
-        ? "auto-synced"
-        : "vocal-anchored";
-      const msg = `Synced "${data.title}" (${data.duration}s) ${sourceInfo} with ${
-        data.aligned_lines?.length || 0
-      } caption lines!`;
+          ? "auto-synced"
+          : "vocal-anchored";
+      const msg = `Synced "${data.title}" (${data.duration}s) ${sourceInfo} with ${data.aligned_lines?.length || 0
+        } caption lines!`;
       setSongFetchMsg(msg);
       showToast(msg);
     } catch (err: any) {
@@ -2101,12 +2330,12 @@ export default function TikTokLyricsVideoEditor() {
         setEditableTimeline(data.aligned_lines);
         setSelectedCaptionIdx(0);
       }
+      setSelectedStartLineIdx(-1);
       if (typeof data.fetched_lyrics === "string" && data.fetched_lyrics.trim()) {
         setManualLyrics(data.fetched_lyrics);
       }
-      const msg = `Cut song from ${formatMmSs(effectiveStart)} (${data.duration}s) & synced ${
-        data.aligned_lines?.length || 0
-      } captions!`;
+      const msg = `Cut song from ${formatMmSs(effectiveStart)} (${data.duration}s) & synced ${data.aligned_lines?.length || 0
+        } captions!`;
       setSongFetchMsg(msg);
       showToast(msg);
     } catch (err: any) {
@@ -2119,12 +2348,20 @@ export default function TikTokLyricsVideoEditor() {
   // Re-run Sinhala ASR Auto-Captioning or Manual Vocal-Anchor Alignment on cached song
   const handleAutoSyncLyricsToAudio = async (
     overrideMode?: "auto" | "manual",
-    overrideManualText?: string
+    overrideManualText?: string,
+    overrideStartLineIdx?: number
   ) => {
     const activeMode = overrideMode || captionMode;
+    const fallbackLyrics =
+      manualLyrics.trim() || editableTimeline.map((l) => l.text).join("\n");
     const rawText =
-      overrideManualText !== undefined ? overrideManualText : manualLyrics;
-    const effectiveManual = activeMode === "manual" ? rawText.trim() : "";
+      overrideManualText !== undefined ? overrideManualText : fallbackLyrics;
+    const effectiveManual =
+      overrideMode === "auto" && overrideManualText === undefined
+        ? ""
+        : rawText.trim();
+    const effectiveStartIdx =
+      overrideStartLineIdx !== undefined ? overrideStartLineIdx : selectedStartLineIdx;
 
     if (!cachedSongId) {
       await handleFetchSong(activeMode);
@@ -2139,7 +2376,6 @@ export default function TikTokLyricsVideoEditor() {
 
     setIsSyncingLyrics(true);
     setSongFetchMsg(null);
-    setEditableTimeline([]);
     try {
       const formData = new FormData();
       formData.append("cached_song_id", cachedSongId);
@@ -2147,6 +2383,7 @@ export default function TikTokLyricsVideoEditor() {
       formData.append("song_name", songName.trim());
       formData.append("artist_name", artistName.trim());
       formData.append("language", language);
+      formData.append("start_line_index", String(effectiveStartIdx));
 
       const res = await fetch(`${API_BASE}/api/sync-lyrics`, {
         method: "POST",
@@ -2164,14 +2401,21 @@ export default function TikTokLyricsVideoEditor() {
       if (data.lyrics_source) {
         setDetectedLyricsSource(data.lyrics_source);
       }
-      if (data.aligned_lines) {
+      if (typeof data.fetched_lyrics === "string" && data.fetched_lyrics.trim()) {
+        const curLines = manualLyrics.split("\n").filter((l) => l.trim()).length;
+        const newLines = data.fetched_lyrics.split("\n").filter((l: string) => l.trim()).length;
+        if (!manualLyrics.trim() || newLines >= curLines) {
+          setManualLyrics(data.fetched_lyrics);
+        }
+      }
+      if (data.aligned_lines && data.aligned_lines.length > 0) {
         setEditableTimeline(data.aligned_lines);
         setSelectedCaptionIdx(0);
       }
       const syncNotice =
-        activeMode === "auto"
-          ? `Synced ${data.aligned_lines?.length || 0} caption lines (${data.lyrics_source || "Auto-Sync"}) directly to the song audio!`
-          : `Synced ${data.aligned_lines?.length || 0} manual Sinhala caption lines to the song's real vocal timestamps!`;
+        effectiveStartIdx >= 0
+          ? `Synced ${data.aligned_lines?.length || 0} caption lines starting from Line #${effectiveStartIdx + 1} to song vocals!`
+          : `Synced ${data.aligned_lines?.length || 0} caption lines (${data.lyrics_source || "Vocal Sync"}) to song vocals!`;
       setSongFetchMsg(syncNotice);
       showToast(syncNotice);
     } catch (err: any) {
@@ -2180,6 +2424,7 @@ export default function TikTokLyricsVideoEditor() {
         return;
       }
       setSongFetchMsg(`Error: ${err.message}`);
+      showToast(`Sync Error: ${err.message}`);
     } finally {
       if (fetchSongAbortRef.current === controller) {
         fetchSongAbortRef.current = null;
@@ -2243,9 +2488,9 @@ export default function TikTokLyricsVideoEditor() {
       editableTimeline.length > 0
         ? editableTimeline.map((l) => l.text)
         : manualLyrics
-            .split("\n")
-            .map((l) => l.trim())
-            .filter((l) => l && !(l.startsWith("[") && l.endsWith("]")));
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l && !(l.startsWith("[") && l.endsWith("]")));
     if (sourceLines.length === 0) return;
 
     const totalDur = fetchedSongDuration || 30;
@@ -2267,7 +2512,7 @@ export default function TikTokLyricsVideoEditor() {
 
     if (audioRef.current) {
       audioRef.current.currentTime = 0;
-      audioRef.current.play().catch(() => {});
+      audioRef.current.play().catch(() => { });
     }
   };
 
@@ -2329,14 +2574,14 @@ export default function TikTokLyricsVideoEditor() {
     videoSegments.length > 0
       ? videoSegments
       : [
-          {
-            start: Math.max(0, Math.min(clipTrimStart || 0, baseRawClipDur - 0.5)),
-            end:
-              clipTrimEnd > 0
-                ? Math.min(baseRawClipDur, (clipTrimStart || 0) + clipTrimEnd)
-                : baseRawClipDur,
-          },
-        ];
+        {
+          start: Math.max(0, Math.min(clipTrimStart || 0, baseRawClipDur - 0.5)),
+          end:
+            clipTrimEnd > 0
+              ? Math.min(baseRawClipDur, (clipTrimStart || 0) + clipTrimEnd)
+              : baseRawClipDur,
+        },
+      ];
 
   const syncTrimFromSegments = (segs: { start: number; end: number }[]) => {
     setVideoSegments(segs);
@@ -2351,6 +2596,54 @@ export default function TikTokLyricsVideoEditor() {
     }
   };
 
+  const mapTimelineSecToVideoSourceSec = (timelineSec: number): number => {
+    const segs = effectiveVideoSegments;
+    if (!segs.length) return 0;
+    const speed = Math.max(0.5, clipSpeed || 1.0);
+    const totalKept = Math.max(
+      0.3,
+      segs.reduce((acc, s) => acc + Math.max(0.2, (s.end - s.start) / speed), 0)
+    );
+    const loopOffset = ((timelineSec % totalKept) + totalKept) % totalKept;
+    let accum = 0;
+    for (let i = 0; i < segs.length; i++) {
+      const segDur = Math.max(0.2, (segs[i].end - segs[i].start) / speed);
+      if (loopOffset <= accum + segDur + 0.01 || i === segs.length - 1) {
+        const localOff = Math.max(0, Math.min(segDur, loopOffset - accum));
+        return Number((segs[i].start + localOff * speed).toFixed(2));
+      }
+      accum += segDur;
+    }
+    return segs[0].start;
+  };
+
+  const handleBladeVideoSegmentAtSourceTime = (segIdx: number, rawCutSourceSec: number) => {
+    if (visualClips.length === 0) {
+      showToast("Upload a video clip first to use the Cut / Blade tool");
+      return;
+    }
+    const segs = [...effectiveVideoSegments];
+    const targetIdx = segs[segIdx] ? segIdx : 0;
+    const chosenSeg = segs[targetIdx];
+    if (!chosenSeg || chosenSeg.end - chosenSeg.start < 0.6) {
+      showToast("Selected video part is too short to split further");
+      return;
+    }
+    let cutSourceSec = Number(rawCutSourceSec.toFixed(2));
+    if (cutSourceSec <= chosenSeg.start + 0.25 || cutSourceSec >= chosenSeg.end - 0.25) {
+      cutSourceSec = Number(((chosenSeg.start + chosenSeg.end) / 2).toFixed(2));
+    }
+    const leftPart = { start: chosenSeg.start, end: cutSourceSec };
+    const rightPart = { start: cutSourceSec, end: chosenSeg.end };
+    const nextSegs = [...segs.slice(0, targetIdx), leftPart, rightPart, ...segs.slice(targetIdx + 1)];
+    syncTrimFromSegments(nextSegs);
+    setSelectedVideoSegmentIdx(targetIdx);
+    setIsVideoBladeMode(false);
+    showToast(
+      `✂️ Cut video at ${cutSourceSec.toFixed(1)}s → Part #${targetIdx + 1} (${leftPart.start.toFixed(1)}s–${leftPart.end.toFixed(1)}s) & Part #${targetIdx + 2} (${rightPart.start.toFixed(1)}s–${rightPart.end.toFixed(1)}s). Click unwanted part & press 🗑️ Delete!`
+    );
+  };
+
   const handleBladeVideoAtTime = (explicitTimelineSec?: number) => {
     if (visualClips.length === 0) {
       showToast("Upload a video clip first to use the Blade tool");
@@ -2362,10 +2655,13 @@ export default function TikTokLyricsVideoEditor() {
       0.5,
       segs.reduce((acc, s) => acc + Math.max(0.2, (s.end - s.start) / speed), 0)
     );
+    const hasActiveAudioPlayhead = (audioRef.current?.currentTime ?? currentAudioTime ?? 0) > 0.15;
     const rawPlayhead =
       explicitTimelineSec !== undefined
         ? explicitTimelineSec
-        : Number((audioRef.current?.currentTime ?? currentAudioTime ?? 0).toFixed(2));
+        : hasActiveAudioPlayhead
+          ? Number((audioRef.current?.currentTime ?? currentAudioTime ?? 0).toFixed(2))
+          : Number((previewVideoRef.current?.currentTime ?? 0).toFixed(2));
     const loopOffset = ((rawPlayhead % totalKeptTimelineDur) + totalKeptTimelineDur) % totalKeptTimelineDur;
 
     let accum = 0;
@@ -2396,19 +2692,7 @@ export default function TikTokLyricsVideoEditor() {
       }
     }
 
-    if (chosenSeg.end - chosenSeg.start < 0.6) {
-      showToast("Selected video part is too short to split further");
-      return;
-    }
-
-    const leftPart = { start: chosenSeg.start, end: cutSourceSec };
-    const rightPart = { start: cutSourceSec, end: chosenSeg.end };
-    const nextSegs = [...segs.slice(0, targetIdx), leftPart, rightPart, ...segs.slice(targetIdx + 1)];
-    syncTrimFromSegments(nextSegs);
-    setSelectedVideoSegmentIdx(targetIdx + 1);
-    showToast(
-      `✂️ Bladed video at ${cutSourceSec.toFixed(1)}s into Part #${targetIdx + 1} & Part #${targetIdx + 2} — click 🗑️ Delete to remove unwanted part`
-    );
+    handleBladeVideoSegmentAtSourceTime(targetIdx, cutSourceSec);
   };
 
   const handleDeleteVideoSegment = (explicitIdx?: number) => {
@@ -2421,8 +2705,8 @@ export default function TikTokLyricsVideoEditor() {
       explicitIdx !== undefined
         ? explicitIdx
         : selectedVideoSegmentIdx !== null && segs[selectedVideoSegmentIdx]
-        ? selectedVideoSegmentIdx
-        : 0;
+          ? selectedVideoSegmentIdx
+          : 0;
 
     if (segs.length <= 1) {
       handleRemoveVisualClip(0);
@@ -2432,7 +2716,12 @@ export default function TikTokLyricsVideoEditor() {
     const removed = segs[targetIdx];
     const nextSegs = segs.filter((_, i) => i !== targetIdx);
     syncTrimFromSegments(nextSegs);
-    setSelectedVideoSegmentIdx(Math.min(targetIdx, nextSegs.length - 1));
+    const nextSel = Math.min(targetIdx, nextSegs.length - 1);
+    setSelectedVideoSegmentIdx(nextSel);
+    setIsVideoBladeMode(false);
+    if (previewVideoRef.current && nextSegs[nextSel]) {
+      previewVideoRef.current.currentTime = nextSegs[nextSel].start;
+    }
     showToast(
       `🗑️ Deleted video part #${targetIdx + 1} (${removed.start.toFixed(1)}s–${removed.end.toFixed(1)}s)`
     );
@@ -2515,7 +2804,7 @@ export default function TikTokLyricsVideoEditor() {
     if (activePreviewTab === "rendered" && renderedVideoRef.current) {
       if (renderedVideoRef.current.paused) {
         audioRef.current?.pause();
-        renderedVideoRef.current.play().catch(() => {});
+        renderedVideoRef.current.play().catch(() => { });
       } else {
         renderedVideoRef.current.pause();
       }
@@ -2523,8 +2812,8 @@ export default function TikTokLyricsVideoEditor() {
     }
     if (!audioRef.current) return;
     if (audioRef.current.paused) {
-      audioRef.current.play().catch(() => {});
-      previewVideoRef.current?.play().catch(() => {});
+      audioRef.current.play().catch(() => { });
+      previewVideoRef.current?.play().catch(() => { });
     } else {
       audioRef.current.pause();
     }
@@ -2541,11 +2830,11 @@ export default function TikTokLyricsVideoEditor() {
     setCurrentAudioTime(clamped);
     if (audioRef.current) {
       audioRef.current.currentTime = clamped;
-      audioRef.current.play().catch(() => {});
+      audioRef.current.play().catch(() => { });
     }
     if (previewVideoRef.current && detectedClipDuration > 0) {
-      previewVideoRef.current.currentTime = clamped % detectedClipDuration;
-      previewVideoRef.current.play().catch(() => {});
+      previewVideoRef.current.currentTime = mapTimelineSecToVideoSourceSec(clamped);
+      previewVideoRef.current.play().catch(() => { });
     }
   };
 
@@ -2623,8 +2912,8 @@ export default function TikTokLyricsVideoEditor() {
           editableTimeline[selectedCaptionIdx] &&
           cutRawTime > editableTimeline[selectedCaptionIdx].start + 0.25 &&
           cutRawTime < editableTimeline[selectedCaptionIdx].end - 0.25
-        ? selectedCaptionIdx
-        : editableTimeline.findIndex(
+          ? selectedCaptionIdx
+          : editableTimeline.findIndex(
             (l) => cutRawTime > l.start + 0.25 && cutRawTime < l.end - 0.25
           );
 
@@ -2711,6 +3000,13 @@ export default function TikTokLyricsVideoEditor() {
       } else if (e.key.toLowerCase() === "s" && selectedCaptionIdx !== null) {
         e.preventDefault();
         snapLineStartToCurrentAudio(selectedCaptionIdx);
+      } else if (
+        (e.key === "Delete" || e.key === "Backspace") &&
+        selectedVideoSegmentIdx !== null &&
+        effectiveVideoSegments.length > 1
+      ) {
+        e.preventDefault();
+        handleDeleteVideoSegment(selectedVideoSegmentIdx);
       } else if (e.key.toLowerCase() === "f") {
         e.preventDefault();
         setIsFullscreenModal((prev) => !prev);
@@ -2745,9 +3041,9 @@ export default function TikTokLyricsVideoEditor() {
     if (e) e.preventDefault();
     setUiError(null);
 
-    if (visualClips.length === 0 && !songUrl.trim() && !cachedSongId) {
+    if (visualClips.length === 0 && !songUrl.trim()) {
       setUiError(
-        "Please upload at least one AI animated video clip (and provide a TikTok/YouTube song link or audio file)."
+        "Please upload at least one AI animated video clip (or provide a video URL)."
       );
       setActiveSidebarTab("media");
       return;
@@ -2760,9 +3056,13 @@ export default function TikTokLyricsVideoEditor() {
     try {
       const formData = new FormData();
 
-      visualClips.forEach((clip) => {
-        formData.append("visual_files", clip);
-      });
+      if (selectedSingleClipIdx !== null && visualClips[selectedSingleClipIdx]) {
+        formData.append("visual_files", visualClips[selectedSingleClipIdx]);
+      } else {
+        visualClips.forEach((clip) => {
+          formData.append("visual_files", clip);
+        });
+      }
 
       if (songSourceMode === "url" && songUrl.trim()) {
         formData.append("song_url", songUrl.trim());
@@ -2825,7 +3125,7 @@ export default function TikTokLyricsVideoEditor() {
       formData.append("fade_in_out", String(fadeInOut));
       formData.append("audio_fade", String(audioFade));
       formData.append("is_draft", String(asDraft));
-      if (!asDraft && activeDraftFilename) {
+      if (activeDraftFilename) {
         formData.append("source_draft_filename", activeDraftFilename);
       }
       formData.append("async_mode", "true");
@@ -2863,17 +3163,17 @@ export default function TikTokLyricsVideoEditor() {
     editableTimeline.length > 0
       ? editableTimeline.map((l) => l.text)
       : manualLyrics
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
 
   const activeSyncedLine: LyricLine | null =
     editableTimeline.length > 0 && (isAudioPlaying || currentAudioTime > 0)
       ? editableTimeline.find(
-          (l) =>
-            currentAudioTime >= l.start + lyricsOffsetSec &&
-            currentAudioTime <= l.end + lyricsOffsetSec
-        ) || null
+        (l) =>
+          currentAudioTime >= l.start + lyricsOffsetSec &&
+          currentAudioTime <= l.end + lyricsOffsetSec
+      ) || null
       : null;
 
   const fallbackPreviewText =
@@ -2928,7 +3228,7 @@ export default function TikTokLyricsVideoEditor() {
           audioRef.current.currentTime = clamped;
         }
         if (previewVideoRef.current && detectedClipDuration > 0) {
-          previewVideoRef.current.currentTime = clamped % detectedClipDuration;
+          previewVideoRef.current.currentTime = mapTimelineSecToVideoSourceSec(clamped);
         }
         return;
       }
@@ -3076,8 +3376,8 @@ export default function TikTokLyricsVideoEditor() {
     tab: SidebarTab;
     badgeClass: string;
   }[] = [
-    ...(blurInterval > 0
-      ? [
+      ...(blurInterval > 0
+        ? [
           {
             id: "blur",
             label: `💧 Blur ${blurInterval}s`,
@@ -3087,9 +3387,9 @@ export default function TikTokLyricsVideoEditor() {
               : "border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-200 hover:bg-fuchsia-500/30",
           },
         ]
-      : []),
-    ...(colorGrade !== "original"
-      ? [
+        : []),
+      ...(colorGrade !== "original"
+        ? [
           {
             id: "grade",
             label: `🎨 ${colorGradeLabels[colorGrade]}`,
@@ -3097,9 +3397,9 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-amber-500/40 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25",
           },
         ]
-      : []),
-    ...(vignette
-      ? [
+        : []),
+      ...(vignette
+        ? [
           {
             id: "vignette",
             label: "🕶️ Vignette",
@@ -3107,9 +3407,9 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-zinc-500/50 bg-zinc-800 text-zinc-200 hover:bg-zinc-700",
           },
         ]
-      : []),
-    ...(hasVideoFades
-      ? [
+        : []),
+      ...(hasVideoFades
+        ? [
           {
             id: "vfade",
             label: "🌅 Video Fade",
@@ -3117,9 +3417,9 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-sky-500/40 bg-sky-500/15 text-sky-200 hover:bg-sky-500/25",
           },
         ]
-      : []),
-    ...(hasAudioFades
-      ? [
+        : []),
+      ...(hasAudioFades
+        ? [
           {
             id: "afade",
             label: "🔊 Audio Fade",
@@ -3127,9 +3427,9 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-purple-500/40 bg-purple-500/15 text-purple-200 hover:bg-purple-500/25",
           },
         ]
-      : []),
-    ...(brightness !== 0 || contrast !== 1 || saturation !== 1
-      ? [
+        : []),
+      ...(brightness !== 0 || contrast !== 1 || saturation !== 1
+        ? [
           {
             id: "eq",
             label: "🎚️ Color EQ",
@@ -3137,9 +3437,9 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-amber-500/40 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25",
           },
         ]
-      : []),
-    ...(videoZoom > 1.01
-      ? [
+        : []),
+      ...(videoZoom > 1.01
+        ? [
           {
             id: "zoom",
             label: `🔍 Zoom ${videoZoom.toFixed(2)}x`,
@@ -3147,9 +3447,9 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-cyan-500/40 bg-cyan-500/15 text-cyan-200 hover:bg-cyan-500/25",
           },
         ]
-      : []),
-    ...(mirrorFlip
-      ? [
+        : []),
+      ...(mirrorFlip
+        ? [
           {
             id: "mirror",
             label: "🪞 Mirror",
@@ -3157,9 +3457,9 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-cyan-500/40 bg-cyan-500/15 text-cyan-200 hover:bg-cyan-500/25",
           },
         ]
-      : []),
-    ...(clipSpeed !== 1.0
-      ? [
+        : []),
+      ...(clipSpeed !== 1.0
+        ? [
           {
             id: "speed",
             label: `⚡ ${clipSpeed}x`,
@@ -3167,29 +3467,29 @@ export default function TikTokLyricsVideoEditor() {
             badgeClass: "border-cyan-500/40 bg-cyan-500/15 text-cyan-200 hover:bg-cyan-500/25",
           },
         ]
-      : []),
-    ...(visualClips.length > 0 && loopCountOnTimeline > 1
-      ? [
+        : []),
+      ...(visualClips.length > 0 && loopCountOnTimeline > 1
+        ? [
           {
             id: "loop",
             label:
               loopMode === "crossfade"
                 ? "✨ xfade Loop"
                 : loopMode === "pingpong"
-                ? "🔄 Boomerang"
-                : "🔁 Smooth Loop",
+                  ? "🔄 Boomerang"
+                  : "🔁 Smooth Loop",
             tab: "media" as SidebarTab,
             badgeClass: "border-sky-500/40 bg-sky-500/15 text-sky-200 hover:bg-sky-500/25",
           },
         ]
-      : []),
-    {
-      id: "captionfx",
-      label: `✍️ ${stylePresetLabels[stylePreset]}`,
-      tab: "fonts" as SidebarTab,
-      badgeClass: "border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25",
-    },
-  ];
+        : []),
+      {
+        id: "captionfx",
+        label: `✍️ ${stylePresetLabels[stylePreset]}`,
+        tab: "fonts" as SidebarTab,
+        badgeClass: "border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25",
+      },
+    ];
 
   const SIDEBAR_ITEMS: { id: SidebarTab; icon: React.ReactNode; label: string; badge?: string }[] = [
     {
@@ -3297,8 +3597,8 @@ export default function TikTokLyricsVideoEditor() {
     stylePreset === "tiktok_yellow" && primaryColorHex.toUpperCase() === "#FFFFFF"
       ? "#FACC15"
       : stylePreset === "neon_cyan" && primaryColorHex.toUpperCase() === "#FFFFFF"
-      ? "#22D3EE"
-      : primaryColorHex;
+        ? "#22D3EE"
+        : primaryColorHex;
 
   const applyFontBrightnessToHex = (hexStr: string, fb: number): string => {
     const cleaned = (hexStr || "#FFFFFF").trim().replace(/^#/, "");
@@ -3333,8 +3633,8 @@ export default function TikTokLyricsVideoEditor() {
     previewCardWidth > 0
       ? previewCardWidth / referenceRenderWidth
       : isFullscreenModal
-      ? 0.45
-      : 0.23;
+        ? 0.45
+        : 0.23;
 
   const activeFontEntry: FontEntry | undefined = installedFonts.find(
     (f) => f.family === selectedFontFamily
@@ -3394,7 +3694,7 @@ export default function TikTokLyricsVideoEditor() {
 
   const editableUiFontFamily =
     activeFontEntry?.encoding === "wijesekara_fm" ||
-    activeFontEntry?.encoding === "isi"
+      activeFontEntry?.encoding === "isi"
       ? '"Sinhala Sangam MN", "Nirmala UI", "Iskoola Pota", "Noto Sans Sinhala", sans-serif'
       : getCssFontFamily(selectedFontFamily);
 
@@ -3449,9 +3749,8 @@ export default function TikTokLyricsVideoEditor() {
             TK
             <span
               title={engineHealth.ready ? "Backend Render Engine Online" : "Backend Render Engine Offline"}
-              className={`absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-zinc-950 ${
-                engineHealth.ready ? "bg-emerald-400" : "bg-rose-500"
-              }`}
+              className={`absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-zinc-950 ${engineHealth.ready ? "bg-emerald-400" : "bg-rose-500"
+                }`}
             />
           </div>
           <div>
@@ -3461,9 +3760,8 @@ export default function TikTokLyricsVideoEditor() {
               </h1>
               <span className="hidden items-center gap-1.5 rounded-full border border-zinc-700/80 bg-zinc-900/90 px-2.5 py-0.5 text-[10px] font-semibold text-zinc-300 sm:inline-flex">
                 <span
-                  className={`h-1.5 w-1.5 rounded-full ${
-                    engineHealth.ready ? "bg-emerald-400 animate-pulse" : "bg-rose-400"
-                  }`}
+                  className={`h-1.5 w-1.5 rounded-full ${engineHealth.ready ? "bg-emerald-400 animate-pulse" : "bg-rose-400"
+                    }`}
                 />
                 {engineHealth.ready ? "Engine Ready • BT.709" : "Backend Offline"}
               </span>
@@ -3489,22 +3787,20 @@ export default function TikTokLyricsVideoEditor() {
                 <button
                   type="button"
                   onClick={() => setActiveSidebarTab(st.tab)}
-                  className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] font-semibold transition ${
-                    isTabActive
-                      ? "bg-zinc-800 text-amber-300 shadow-sm"
-                      : st.done
+                  className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] font-semibold transition ${isTabActive
+                    ? "bg-zinc-800 text-amber-300 shadow-sm"
+                    : st.done
                       ? "text-emerald-300 hover:bg-zinc-800/60"
                       : "text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200"
-                  }`}
+                    }`}
                 >
                   <span
-                    className={`flex h-4 w-4 items-center justify-center rounded-full text-[9px] font-bold ${
-                      st.done
-                        ? "bg-emerald-500 text-black"
-                        : isTabActive
+                    className={`flex h-4 w-4 items-center justify-center rounded-full text-[9px] font-bold ${st.done
+                      ? "bg-emerald-500 text-black"
+                      : isTabActive
                         ? "bg-amber-400 text-black"
                         : "bg-zinc-800 text-zinc-400"
-                    }`}
+                      }`}
                   >
                     {st.done ? <Check className="h-2.5 w-2.5 stroke-[3]" /> : st.num}
                   </span>
@@ -3617,11 +3913,10 @@ export default function TikTokLyricsVideoEditor() {
                 key={item.id}
                 type="button"
                 onClick={() => setActiveSidebarTab(item.id)}
-                className={`group relative flex shrink-0 flex-col items-center justify-center rounded-xl px-3 py-2.5 text-center transition-all lg:w-full ${
-                  active
-                    ? "bg-gradient-to-b from-amber-400 to-amber-500 text-black font-bold shadow-md shadow-amber-500/20 ring-1 ring-amber-300/60"
-                    : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
-                }`}
+                className={`group relative flex shrink-0 flex-col items-center justify-center rounded-xl px-3 py-2.5 text-center transition-all lg:w-full ${active
+                  ? "bg-gradient-to-b from-amber-400 to-amber-500 text-black font-bold shadow-md shadow-amber-500/20 ring-1 ring-amber-300/60"
+                  : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
+                  }`}
               >
                 {active && (
                   <span className="hidden lg:block absolute left-0 top-2.5 bottom-2.5 w-1 rounded-r-full bg-black/50" />
@@ -3630,9 +3925,8 @@ export default function TikTokLyricsVideoEditor() {
                 <span className="mt-1 text-[10px] tracking-tight leading-tight">{item.label}</span>
                 {item.badge && (
                   <span
-                    className={`absolute right-1.5 top-1 rounded-full px-1.5 py-0.2 text-[9px] font-bold ${
-                      active ? "bg-black text-amber-300" : "bg-amber-400/20 text-amber-300"
-                    }`}
+                    className={`absolute right-1.5 top-1 rounded-full px-1.5 py-0.2 text-[9px] font-bold ${active ? "bg-black text-amber-300" : "bg-amber-400/20 text-amber-300"
+                      }`}
                   >
                     {item.badge}
                   </span>
@@ -3674,11 +3968,10 @@ export default function TikTokLyricsVideoEditor() {
                 }}
                 onDragLeave={() => setIsDraggingClip(false)}
                 onDrop={handleDropClips}
-                className={`flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-4 py-6 text-center transition-all ${
-                  isDraggingClip
-                    ? "border-amber-400 bg-amber-400/10 scale-[1.01]"
-                    : "border-zinc-700/80 bg-zinc-950/80 hover:border-amber-400/70 hover:bg-zinc-900/60"
-                }`}
+                className={`flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-4 py-6 text-center transition-all ${isDraggingClip
+                  ? "border-amber-400 bg-amber-400/10 scale-[1.01]"
+                  : "border-zinc-700/80 bg-zinc-950/80 hover:border-amber-400/70 hover:bg-zinc-900/60"
+                  }`}
               >
                 <Upload className="mb-2 h-5 w-5 text-amber-400" />
                 <span className="text-xs font-bold text-amber-300">
@@ -3698,61 +3991,130 @@ export default function TikTokLyricsVideoEditor() {
 
               {visualClips.length > 0 && (
                 <div className="space-y-2">
-                  <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-                    {visualClips.map((clip, index) => (
-                      <div
-                        key={`${clip.name}-${index}`}
-                        className="flex items-center justify-between rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs"
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-amber-400/20 font-mono text-[10px] font-bold text-amber-300">
-                            {index + 1}
-                          </span>
-                          <span className="truncate font-medium text-zinc-200">{clip.name}</span>
-                          <span className="shrink-0 font-mono text-[10px] text-zinc-500">
-                            {(clip.size / (1024 * 1024)).toFixed(1)}MB
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          {index === 0 && (
+                  {visualClips.length > 1 && (
+                    <div className="rounded-xl border border-amber-400/35 bg-amber-400/10 p-2 text-[11px] space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-bold text-amber-200">
+                          {selectedSingleClipIdx === null
+                            ? `✨ Multi-Video Mix & Blend (${visualClips.length} clips across song timeline)`
+                            : `🔁 Single-Clip Repeat Mode (Only Clip #${selectedSingleClipIdx + 1})`}
+                        </span>
+                        {selectedSingleClipIdx !== null && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedSingleClipIdx(null);
+                              showToast(
+                                `✨ Mixing & blending all ${visualClips.length} videos across the song timeline`
+                              );
+                            }}
+                            className="shrink-0 rounded-lg bg-amber-400 px-2 py-0.5 text-[10px] font-extrabold text-black hover:bg-amber-300"
+                          >
+                            ✨ Mix All {visualClips.length} Clips
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-amber-100/80">
+                        {selectedSingleClipIdx === null
+                          ? "All uploaded videos will smoothly mix & crossfade-blend across the song timeline. Click '🔁 Repeat Only This' on any single video below if you want only that video to loop."
+                          : `Only Clip #${selectedSingleClipIdx + 1} (${visualClips[selectedSingleClipIdx]?.name}) will repeat across the entire song duration.`}
+                      </p>
+                    </div>
+                  )}
+                  <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+                    {visualClips.map((clip, index) => {
+                      const isOnlySelected = selectedSingleClipIdx === index;
+                      const isMutedBySingleSelect =
+                        selectedSingleClipIdx !== null && selectedSingleClipIdx !== index;
+                      return (
+                        <div
+                          key={`${clip.name}-${index}`}
+                          className={`flex items-center justify-between rounded-xl border px-3 py-2 text-xs transition ${isOnlySelected
+                            ? "border-amber-400 bg-amber-400/15"
+                            : isMutedBySingleSelect
+                              ? "border-zinc-800/60 bg-zinc-950/50 opacity-55"
+                              : "border-zinc-800 bg-zinc-950"
+                            }`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-amber-400/20 font-mono text-[10px] font-bold text-amber-300">
+                              {index + 1}
+                            </span>
+                            <span className="truncate font-medium text-zinc-200">{clip.name}</span>
+                            <span className="shrink-0 font-mono text-[10px] text-zinc-500">
+                              {(clip.size / (1024 * 1024)).toFixed(1)}MB
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            {visualClips.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (isOnlySelected) {
+                                    setSelectedSingleClipIdx(null);
+                                    showToast(
+                                      `✨ Mixing & blending all ${visualClips.length} clips across song timeline`
+                                    );
+                                  } else {
+                                    setSelectedSingleClipIdx(index);
+                                    showToast(
+                                      `🔁 Repeating only Clip #${index + 1} (${clip.name}) across song duration`
+                                    );
+                                  }
+                                }}
+                                title={
+                                  isOnlySelected
+                                    ? "Click to switch back to Mix & Blend All Clips"
+                                    : "Click to repeat ONLY this clip for the entire song duration"
+                                }
+                                className={`inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 text-[10px] font-bold transition ${isOnlySelected
+                                  ? "border-amber-300 bg-amber-400 text-black"
+                                  : "border-amber-400/35 bg-amber-400/10 text-amber-300 hover:bg-amber-400/25"
+                                  }`}
+                              >
+                                {isOnlySelected ? "🔁 Repeating Only This" : "🔁 Repeat Only"}
+                              </button>
+                            )}
+                            {index === 0 && (
+                              <button
+                                type="button"
+                                onClick={() => handleBladeVideoAtTime()}
+                                title="Blade / Split main video at current playhead"
+                                className="inline-flex items-center gap-1 rounded-lg border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 text-[10px] font-bold text-sky-300 hover:bg-sky-500/25"
+                              >
+                                <Scissors className="h-3 w-3" />
+                                Blade
+                              </button>
+                            )}
                             <button
                               type="button"
-                              onClick={() => handleBladeVideoAtTime()}
-                              title="Blade / Split main video at current playhead"
-                              className="inline-flex items-center gap-1 rounded-lg border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 text-[10px] font-bold text-sky-300 hover:bg-sky-500/25"
+                              onClick={() => handleMoveClip(index, -1)}
+                              disabled={index === 0}
+                              className="rounded border border-zinc-800 px-1.5 py-0.5 text-zinc-400 hover:text-white disabled:opacity-30"
                             >
-                              <Scissors className="h-3 w-3" />
-                              Blade
+                              ↑
                             </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleMoveClip(index, -1)}
-                            disabled={index === 0}
-                            className="rounded border border-zinc-800 px-1.5 py-0.5 text-zinc-400 hover:text-white disabled:opacity-30"
-                          >
-                            ↑
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleMoveClip(index, 1)}
-                            disabled={index === visualClips.length - 1}
-                            className="rounded border border-zinc-800 px-1.5 py-0.5 text-zinc-400 hover:text-white disabled:opacity-30"
-                          >
-                            ↓
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveVisualClip(index)}
-                            title="Delete this video clip"
-                            className="ml-0.5 inline-flex items-center gap-1 rounded-lg border border-red-500/35 bg-red-500/10 px-2 py-0.5 text-[10px] font-bold text-red-300 hover:bg-red-500/25"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                            Delete
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => handleMoveClip(index, 1)}
+                              disabled={index === visualClips.length - 1}
+                              className="rounded border border-zinc-800 px-1.5 py-0.5 text-zinc-400 hover:text-white disabled:opacity-30"
+                            >
+                              ↓
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveVisualClip(index)}
+                              title="Delete this video clip"
+                              className="ml-0.5 inline-flex items-center gap-1 rounded-lg border border-red-500/35 bg-red-500/10 px-2 py-0.5 text-[10px] font-bold text-red-300 hover:bg-red-500/25"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              Delete
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
 
                   {/* Interactive Main Video Blade & Delete Segments Inspector */}
@@ -3796,11 +4158,10 @@ export default function TikTokLyricsVideoEditor() {
                                 previewVideoRef.current.currentTime = seg.start;
                               }
                             }}
-                            className={`flex cursor-pointer items-center justify-between rounded-lg border px-2.5 py-1.5 text-[11px] transition ${
-                              isSel
-                                ? "border-sky-400 bg-sky-500/20 text-white font-semibold"
-                                : "border-zinc-800 bg-zinc-900/80 text-zinc-300 hover:border-zinc-700"
-                            }`}
+                            className={`flex cursor-pointer items-center justify-between rounded-lg border px-2.5 py-1.5 text-[11px] transition ${isSel
+                              ? "border-sky-400 bg-sky-500/20 text-white font-semibold"
+                              : "border-zinc-800 bg-zinc-900/80 text-zinc-300 hover:border-zinc-700"
+                              }`}
                           >
                             <span>
                               🎬 Part #{sIdx + 1}:{" "}
@@ -3980,22 +4341,20 @@ export default function TikTokLyricsVideoEditor() {
                 <button
                   type="button"
                   onClick={() => setSongSourceMode("url")}
-                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${
-                    songSourceMode === "url"
-                      ? "bg-amber-400 text-black"
-                      : "text-zinc-400 hover:text-white"
-                  }`}
+                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${songSourceMode === "url"
+                    ? "bg-amber-400 text-black"
+                    : "text-zinc-400 hover:text-white"
+                    }`}
                 >
                   TikTok / YouTube Link
                 </button>
                 <button
                   type="button"
                   onClick={() => setSongSourceMode("upload")}
-                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${
-                    songSourceMode === "upload"
-                      ? "bg-amber-400 text-black"
-                      : "text-zinc-400 hover:text-white"
-                  }`}
+                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${songSourceMode === "upload"
+                    ? "bg-amber-400 text-black"
+                    : "text-zinc-400 hover:text-white"
+                    }`}
                 >
                   Upload Audio File
                 </button>
@@ -4076,11 +4435,10 @@ export default function TikTokLyricsVideoEditor() {
 
               {songFetchMsg && (
                 <div
-                  className={`rounded-xl border px-3 py-2 text-xs ${
-                    songFetchMsg.startsWith("Error:")
-                      ? "border-red-500/40 bg-red-500/10 text-red-300"
-                      : "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                  }`}
+                  className={`rounded-xl border px-3 py-2 text-xs ${songFetchMsg.startsWith("Error:")
+                    ? "border-red-500/40 bg-red-500/10 text-red-300"
+                    : "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                    }`}
                 >
                   {songFetchMsg}
                 </div>
@@ -4159,13 +4517,13 @@ export default function TikTokLyricsVideoEditor() {
                       {formatMmSs(audioStartSec)} →{" "}
                       {audioMaxDurationSec > 0
                         ? formatMmSs(
-                            rawSongDuration
-                              ? Math.min(rawSongDuration, audioStartSec + audioMaxDurationSec)
-                              : audioStartSec + audioMaxDurationSec
-                          )
+                          rawSongDuration
+                            ? Math.min(rawSongDuration, audioStartSec + audioMaxDurationSec)
+                            : audioStartSec + audioMaxDurationSec
+                        )
                         : rawSongDuration
-                        ? formatMmSs(rawSongDuration)
-                        : "End"}
+                          ? formatMmSs(rawSongDuration)
+                          : "End"}
                     </span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5">
@@ -4174,11 +4532,10 @@ export default function TikTokLyricsVideoEditor() {
                         key={secPreset}
                         type="button"
                         onClick={() => setAudioMaxDurationSec(secPreset)}
-                        className={`rounded-md px-2 py-1 text-[10px] font-bold transition ${
-                          audioMaxDurationSec === secPreset
-                            ? "bg-amber-400 text-black"
-                            : "border border-zinc-800 bg-zinc-950 text-zinc-300 hover:border-amber-400/50"
-                        }`}
+                        className={`rounded-md px-2 py-1 text-[10px] font-bold transition ${audioMaxDurationSec === secPreset
+                          ? "bg-amber-400 text-black"
+                          : "border border-zinc-800 bg-zinc-950 text-zinc-300 hover:border-amber-400/50"
+                          }`}
                       >
                         {secPreset === 0 ? "Full End" : `${secPreset}s`}
                       </button>
@@ -4203,9 +4560,8 @@ export default function TikTokLyricsVideoEditor() {
                   >
                     {isTrimmingSong
                       ? "Cutting Segment & Re-Syncing..."
-                      : `✂️ Apply Song Cut (${formatMmSs(audioStartSec)}${
-                          audioMaxDurationSec > 0 ? ` • ${audioMaxDurationSec}s` : " → End"
-                        }) & Re-Sync`}
+                      : `✂️ Apply Song Cut (${formatMmSs(audioStartSec)}${audioMaxDurationSec > 0 ? ` • ${audioMaxDurationSec}s` : " → End"
+                      }) & Re-Sync`}
                   </button>
                 )}
 
@@ -4276,11 +4632,18 @@ export default function TikTokLyricsVideoEditor() {
                       </span>
                     )}
                     <span className="rounded bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
-                      {editableTimeline.length > 0
-                        ? `${editableTimeline.length} lines`
-                        : manualLyrics.trim()
-                        ? `${manualLyrics.split("\n").filter((l) => l.trim()).length} lines`
-                        : "0 lines"}
+                      {(() => {
+                        const fullCount = manualLyrics
+                          .split("\n")
+                          .map((l) => l.trim())
+                          .filter((l) => l && !(l.startsWith("[") && l.endsWith("]"))).length;
+                        const syncedCount = editableTimeline.length;
+                        if (fullCount > 0 && syncedCount > 0 && fullCount !== syncedCount) {
+                          return `${syncedCount} synced / ${fullCount} full lines`;
+                        }
+                        if (fullCount > 0) return `${fullCount} full lines`;
+                        return `${syncedCount} lines`;
+                      })()}
                     </span>
                   </div>
 
@@ -4289,22 +4652,20 @@ export default function TikTokLyricsVideoEditor() {
                       <button
                         type="button"
                         onClick={() => setAudioTabLyricsView("synced")}
-                        className={`rounded-md px-2 py-0.5 font-semibold transition ${
-                          audioTabLyricsView === "synced"
-                            ? "bg-emerald-400 text-black"
-                            : "text-zinc-400 hover:text-white"
-                        }`}
+                        className={`rounded-md px-2 py-0.5 font-semibold transition ${audioTabLyricsView === "synced"
+                          ? "bg-emerald-400 text-black"
+                          : "text-zinc-400 hover:text-white"
+                          }`}
                       >
                         ⏱ Synced
                       </button>
                       <button
                         type="button"
                         onClick={() => setAudioTabLyricsView("text")}
-                        className={`rounded-md px-2 py-0.5 font-semibold transition ${
-                          audioTabLyricsView === "text"
-                            ? "bg-emerald-400 text-black"
-                            : "text-zinc-400 hover:text-white"
-                        }`}
+                        className={`rounded-md px-2 py-0.5 font-semibold transition ${audioTabLyricsView === "text"
+                          ? "bg-emerald-400 text-black"
+                          : "text-zinc-400 hover:text-white"
+                          }`}
                       >
                         📝 Full Text
                       </button>
@@ -4316,7 +4677,7 @@ export default function TikTokLyricsVideoEditor() {
                           const txt =
                             manualLyrics.trim() ||
                             editableTimeline.map((l) => l.text).join("\n");
-                          navigator.clipboard?.writeText(txt).catch(() => {});
+                          navigator.clipboard?.writeText(txt).catch(() => { });
                           showToast("📋 Copied fetched lyrics to clipboard");
                         }}
                         title="Copy fetched lyrics text"
@@ -4330,11 +4691,10 @@ export default function TikTokLyricsVideoEditor() {
 
                 {webLyricsStatus && (
                   <div
-                    className={`rounded-lg px-2.5 py-1.5 text-[11px] ${
-                      webLyricsStatus.startsWith("Error:")
-                        ? "bg-red-500/10 text-red-300"
-                        : "bg-emerald-500/10 text-emerald-300"
-                    }`}
+                    className={`rounded-lg px-2.5 py-1.5 text-[11px] ${webLyricsStatus.startsWith("Error:")
+                      ? "bg-red-500/10 text-red-300"
+                      : "bg-emerald-500/10 text-emerald-300"
+                      }`}
                   >
                     {webLyricsStatus}
                   </div>
@@ -4390,74 +4750,288 @@ export default function TikTokLyricsVideoEditor() {
                     <span className="font-bold text-amber-300">⚡ Fetch &amp; Auto-Sync Song</span>{" "}
                     above — the detected Sinhala/synced lyrics will appear right here.
                   </div>
-                ) : audioTabLyricsView === "synced" && editableTimeline.length > 0 ? (
-                  <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
-                    {editableTimeline.map((line, idx) => {
-                      const isPlayingLine =
-                        currentAudioTime >= line.start + lyricsOffsetSec &&
-                        currentAudioTime <= line.end + lyricsOffsetSec;
+                ) : (
+                  <div className="space-y-2.5">
+                    {(() => {
+                      const fullLyricLines = (
+                        manualLyrics.trim()
+                          ? manualLyrics
+                            .split("\n")
+                            .map((l) => l.trim())
+                            .filter((l) => l && !(l.startsWith("[") && l.endsWith("]")))
+                          : editableTimeline.map((l) => l.text)
+                      );
                       return (
-                        <div
-                          key={idx}
-                          onClick={() => {
-                            setSelectedCaptionIdx(idx);
-                            seekAudioTo(line.start + lyricsOffsetSec);
-                          }}
-                          className={`group flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-1.5 text-xs transition ${
-                            isPlayingLine
-                              ? "border-emerald-400 bg-emerald-500/20 text-white shadow-sm"
-                              : selectedCaptionIdx === idx
-                              ? "border-amber-400/60 bg-amber-400/10 text-zinc-100"
-                              : "border-zinc-800/90 bg-zinc-900/75 text-zinc-200 hover:border-zinc-700"
-                          }`}
-                        >
-                          <span className="shrink-0 rounded bg-zinc-950 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
-                            {formatMmSs(line.start)} → {formatMmSs(line.end)}
-                          </span>
-                          <input
-                            type="text"
-                            value={line.text}
-                            onClick={(e) => e.stopPropagation()}
-                            onChange={(e) => handleTimelineChange(idx, "text", e.target.value)}
-                            style={{ fontFamily: editableUiFontFamily }}
-                            className="min-w-0 flex-1 bg-transparent text-xs text-white focus:outline-none"
-                          />
+                        <div className="rounded-lg border border-amber-400/30 bg-zinc-900/90 p-2 space-y-2">
+                          <div className="flex flex-col gap-1">
+                            <label className="text-[10px] font-bold text-amber-300">
+                              🎯 Song Starts At Lyric Line (මැදින් පටන් ගන්නා පේළිය තෝරන්න):
+                            </label>
+                            <select
+                              value={selectedStartLineIdx}
+                              onChange={(e) => {
+                                const nextIdx = parseInt(e.target.value, 10);
+                                setSelectedStartLineIdx(nextIdx);
+                                if (cachedSongId) {
+                                  const fullTxt =
+                                    manualLyrics.trim() ||
+                                    editableTimeline.map((l) => l.text).join("\n");
+                                  handleAutoSyncLyricsToAudio("manual", fullTxt, nextIdx);
+                                }
+                              }}
+                              style={{ fontFamily: editableUiFontFamily }}
+                              className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100 focus:border-amber-400 focus:outline-none"
+                            >
+                              <option value={-1}>
+                                🤖 Auto-Detect from Song Voice (හඬ අනුව මැදින් පටන් ගන්නා තැන Auto හඳුනාගන්න)
+                              </option>
+                              {fullLyricLines.map((lnText, lIdx) => (
+                                <option key={lIdx} value={lIdx}>
+                                  Line #{lIdx + 1}: {lnText}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          {cachedSongId && (
+                            <button
+                              type="button"
+                              disabled={isSyncingLyrics}
+                              onClick={() =>
+                                handleAutoSyncLyricsToAudio(
+                                  "manual",
+                                  manualLyrics.trim() ||
+                                  editableTimeline.map((l) => l.text).join("\n"),
+                                  selectedStartLineIdx
+                                )
+                              }
+                              className="w-full rounded-lg bg-emerald-400 py-1.5 text-xs font-extrabold text-black transition hover:bg-emerald-300 disabled:opacity-50"
+                            >
+                              {isSyncingLyrics
+                                ? "Re-Syncing Lyrics to Song Voice..."
+                                : selectedStartLineIdx >= 0
+                                  ? `⚡ Apply & Re-Sync from Line #${selectedStartLineIdx + 1}`
+                                  : "⚡ Apply & Re-Sync Lyrics to Song Voice"}
+                            </button>
+                          )}
                         </div>
                       );
-                    })}
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <textarea
-                      rows={6}
-                      value={
-                        manualLyrics ||
-                        editableTimeline.map((l) => l.text).join("\n")
-                      }
-                      onChange={(e) => {
-                        setManualLyrics(e.target.value);
-                        setCaptionMode("manual");
-                      }}
-                      style={{ fontFamily: editableUiFontFamily }}
-                      placeholder="Fetched Sinhala lyrics appear here..."
-                      className="w-full rounded-xl border border-zinc-800 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-100 focus:border-emerald-400 focus:outline-none"
-                    />
-                    {cachedSongId && (
-                      <button
-                        type="button"
-                        disabled={isSyncingLyrics}
-                        onClick={() =>
-                          handleAutoSyncLyricsToAudio(
-                            "manual",
-                            manualLyrics || editableTimeline.map((l) => l.text).join("\n")
-                          )
-                        }
-                        className="w-full rounded-lg bg-emerald-400 py-1.5 text-xs font-extrabold text-black transition hover:bg-emerald-300 disabled:opacity-50"
-                      >
-                        {isSyncingLyrics
-                          ? "Re-Syncing Lyrics to Song..."
-                          : "⚡ Apply & Re-Sync Edited Lyrics"}
-                      </button>
+                    })()}
+
+                    {audioTabLyricsView === "synced" && editableTimeline.length > 0 ? (
+                      <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+                        {editableTimeline.map((line, idx) => {
+                          const isPlayingLine =
+                            currentAudioTime >= line.start + lyricsOffsetSec &&
+                            currentAudioTime <= line.end + lyricsOffsetSec;
+                          return (
+                            <div
+                              key={idx}
+                              onClick={() => {
+                                setSelectedCaptionIdx(idx);
+                                seekAudioTo(line.start + lyricsOffsetSec);
+                              }}
+                              className={`group flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-1.5 text-xs transition ${isPlayingLine
+                                ? "border-emerald-400 bg-emerald-500/20 text-white shadow-sm"
+                                : selectedCaptionIdx === idx
+                                  ? "border-amber-400/60 bg-amber-400/10 text-zinc-100"
+                                  : "border-zinc-800/90 bg-zinc-900/75 text-zinc-200 hover:border-zinc-700"
+                                }`}
+                            >
+                              <span className="shrink-0 rounded bg-zinc-950 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
+                                {formatMmSs(line.start)} → {formatMmSs(line.end)}
+                              </span>
+                              <input
+                                type="text"
+                                value={line.text}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) => handleTimelineChange(idx, "text", e.target.value)}
+                                style={{ fontFamily: editableUiFontFamily }}
+                                className="min-w-0 flex-1 bg-transparent text-xs text-white focus:outline-none"
+                              />
+                              {cachedSongId && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const fullLines = (
+                                      manualLyrics.trim()
+                                        ? manualLyrics
+                                          .split("\n")
+                                          .map((l) => l.trim())
+                                          .filter((l) => l && !(l.startsWith("[") && l.endsWith("]")))
+                                        : editableTimeline.map((l) => l.text)
+                                    );
+                                    const matchIdx = fullLines.findIndex((fl) => fl === line.text.trim());
+                                    const startIdx = matchIdx >= 0 ? matchIdx : idx;
+                                    setSelectedStartLineIdx(startIdx);
+                                    handleAutoSyncLyricsToAudio(
+                                      "manual",
+                                      fullLines.join("\n"),
+                                      startIdx
+                                    );
+                                  }}
+                                  title="Set this line as the first sung line of the song and re-sync"
+                                  className="shrink-0 rounded border border-amber-400/40 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-bold text-amber-300 opacity-80 hover:bg-amber-400 hover:text-black group-hover:opacity-100"
+                                >
+                                  ▶ Start Here
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      (() => {
+                        const fullSongLines = (
+                          manualLyrics.trim()
+                            ? manualLyrics
+                              .split("\n")
+                              .map((l) => l.trim())
+                              .filter((l) => l && !(l.startsWith("[") && l.endsWith("]")))
+                            : editableTimeline.map((l) => l.text)
+                        );
+                        return (
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-400/25 bg-amber-400/10 px-2.5 py-1.5 text-[11px] text-amber-200">
+                              <span>
+                                👆 Click any lyric line below to set where the song starts &amp; sync from that line forward ({fullSongLines.length} full song lines):
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setIsEditingFullLyricsText((prev) => !prev)}
+                                className="shrink-0 rounded border border-amber-400/40 bg-zinc-900 px-2 py-0.5 text-[10px] font-bold text-amber-300 hover:bg-amber-400 hover:text-black"
+                              >
+                                {isEditingFullLyricsText ? "📋 Line Picker" : "✏️ Edit Text"}
+                              </button>
+                            </div>
+
+                            {!isEditingFullLyricsText && fullSongLines.length > 0 ? (
+                              <div className="max-h-60 space-y-1 overflow-y-auto pr-1">
+                                {fullSongLines.map((lnText, lIdx) => {
+                                  const isSelectedStart = selectedStartLineIdx === lIdx;
+                                  const isInSyncedRange =
+                                    selectedStartLineIdx >= 0
+                                      ? lIdx >= selectedStartLineIdx &&
+                                      lIdx < selectedStartLineIdx + Math.max(1, editableTimeline.length)
+                                      : editableTimeline.some((el) => el.text.trim() === lnText.trim());
+                                  return (
+                                    <div
+                                      key={lIdx}
+                                      onClick={() => {
+                                        setSelectedStartLineIdx(lIdx);
+                                        const fullTxt = fullSongLines.join("\n");
+                                        setManualLyrics(fullTxt);
+                                        setCaptionMode("manual");
+                                        if (cachedSongId) {
+                                          handleAutoSyncLyricsToAudio("manual", fullTxt, lIdx);
+                                        } else {
+                                          showToast(
+                                            `🎯 Selected Line #${lIdx + 1} as song start — click Fetch/Sync when ready!`
+                                          );
+                                        }
+                                      }}
+                                      title={`Click to start song captions from Line #${lIdx + 1} and voice-sync forward`}
+                                      className={`group flex cursor-pointer items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-xs transition ${isSelectedStart
+                                        ? "border-amber-400 bg-amber-400/20 text-white font-bold shadow-sm ring-1 ring-amber-400/50"
+                                        : isInSyncedRange
+                                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100 hover:border-amber-400"
+                                          : "border-zinc-800/80 bg-zinc-900/60 text-zinc-300 hover:border-amber-400/60 hover:bg-zinc-900"
+                                        }`}
+                                    >
+                                      <div className="flex items-center gap-2 min-w-0">
+                                        <span
+                                          className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] font-bold ${isSelectedStart
+                                            ? "bg-amber-400 text-black"
+                                            : isInSyncedRange
+                                              ? "bg-emerald-500/25 text-emerald-300"
+                                              : "bg-zinc-950 text-zinc-400"
+                                            }`}
+                                        >
+                                          #{lIdx + 1}
+                                        </span>
+                                        <span
+                                          style={{ fontFamily: editableUiFontFamily }}
+                                          className="truncate"
+                                        >
+                                          {lnText}
+                                        </span>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setSelectedStartLineIdx(lIdx);
+                                          const fullTxt = fullSongLines.join("\n");
+                                          setManualLyrics(fullTxt);
+                                          setCaptionMode("manual");
+                                          if (cachedSongId) {
+                                            handleAutoSyncLyricsToAudio("manual", fullTxt, lIdx);
+                                          }
+                                        }}
+                                        className={`shrink-0 rounded px-2 py-0.5 text-[10px] font-extrabold transition ${isSelectedStart
+                                          ? "bg-amber-400 text-black"
+                                          : "border border-amber-400/40 bg-amber-400/10 text-amber-300 hover:bg-amber-400 hover:text-black"
+                                          }`}
+                                      >
+                                        {isSelectedStart ? "🎯 Starts Here" : "▶ Start From Here"}
+                                      </button>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                <textarea
+                                  rows={7}
+                                  value={
+                                    manualLyrics ||
+                                    editableTimeline.map((l) => l.text).join("\n")
+                                  }
+                                  onChange={(e) => {
+                                    const nextVal = e.target.value;
+                                    const lineCount = nextVal
+                                      .split("\n")
+                                      .map((l) => l.trim())
+                                      .filter((l) => l && !(l.startsWith("[") && l.endsWith("]"))).length;
+                                    setManualLyrics(nextVal);
+                                    setCaptionMode("manual");
+                                    if (selectedStartLineIdx >= lineCount) {
+                                      setSelectedStartLineIdx(-1);
+                                    }
+                                  }}
+                                  style={{ fontFamily: editableUiFontFamily }}
+                                  placeholder="Fetched full song Sinhala lyrics appear here..."
+                                  className="w-full rounded-xl border border-zinc-800 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-100 focus:border-emerald-400 focus:outline-none"
+                                />
+                                <button
+                                  type="button"
+                                  disabled={isSyncingLyrics || isFetchingSong}
+                                  onClick={() => {
+                                    const txt =
+                                      manualLyrics ||
+                                      editableTimeline.map((l) => l.text).join("\n");
+                                    if (txt.trim()) {
+                                      handleAutoSyncLyricsToAudio(
+                                        "manual",
+                                        txt,
+                                        selectedStartLineIdx
+                                      );
+                                    }
+                                  }}
+                                  className="w-full rounded-lg bg-emerald-400 py-2 text-xs font-extrabold text-black transition hover:bg-emerald-300 disabled:opacity-40"
+                                >
+                                  {isSyncingLyrics || isFetchingSong
+                                    ? "Syncing Edited Lyrics to Song Vocals..."
+                                    : selectedStartLineIdx >= 0
+                                      ? `⚡ Apply & Re-Sync from Line #${selectedStartLineIdx + 1}`
+                                      : "⚡ Apply & Re-Sync Edited Lyrics"}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()
                     )}
                   </div>
                 )}
@@ -4511,11 +5085,10 @@ export default function TikTokLyricsVideoEditor() {
 
                 {webLyricsStatus && (
                   <div
-                    className={`rounded-lg px-2.5 py-1.5 text-[11px] ${
-                      webLyricsStatus.startsWith("Error:")
-                        ? "bg-red-500/10 text-red-300"
-                        : "bg-emerald-500/10 text-emerald-300"
-                    }`}
+                    className={`rounded-lg px-2.5 py-1.5 text-[11px] ${webLyricsStatus.startsWith("Error:")
+                      ? "bg-red-500/10 text-red-300"
+                      : "bg-emerald-500/10 text-emerald-300"
+                      }`}
                   >
                     {webLyricsStatus}
                   </div>
@@ -4555,11 +5128,10 @@ export default function TikTokLyricsVideoEditor() {
                     setCaptionMode("auto");
                     setEditableTimeline([]);
                   }}
-                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${
-                    captionMode === "auto"
-                      ? "bg-amber-400 text-black"
-                      : "text-zinc-400 hover:text-white"
-                  }`}
+                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${captionMode === "auto"
+                    ? "bg-amber-400 text-black"
+                    : "text-zinc-400 hover:text-white"
+                    }`}
                 >
                   🤖 Auto-Generate
                 </button>
@@ -4569,11 +5141,10 @@ export default function TikTokLyricsVideoEditor() {
                     setCaptionMode("manual");
                     setEditableTimeline([]);
                   }}
-                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${
-                    captionMode === "manual"
-                      ? "bg-emerald-400 text-black"
-                      : "text-zinc-400 hover:text-white"
-                  }`}
+                  className={`rounded-lg py-1.5 text-xs font-semibold transition ${captionMode === "manual"
+                    ? "bg-emerald-400 text-black"
+                    : "text-zinc-400 hover:text-white"
+                    }`}
                 >
                   ✍️ Manual Lyrics
                 </button>
@@ -4667,16 +5238,46 @@ export default function TikTokLyricsVideoEditor() {
                     placeholder="ඔබේ සිංහල ගීතයේ පද පේළි මෙතන Paste කරන්න (එක පේළියකට එක කොටසක් බැගින්)..."
                     className="w-full rounded-xl border border-zinc-800 bg-zinc-950 p-3 text-xs leading-relaxed text-zinc-100 placeholder-zinc-500 focus:border-emerald-400 focus:outline-none"
                   />
+                  {manualLyrics.trim() && (
+                    <div className="rounded-lg border border-amber-400/30 bg-zinc-950 p-2 space-y-1">
+                      <label className="text-[10px] font-bold text-amber-300">
+                        🎯 Song Starts At Lyric Line (මැදින් පටන් ගන්නා පේළිය තෝරන්න):
+                      </label>
+                      <select
+                        value={selectedStartLineIdx}
+                        onChange={(e) => setSelectedStartLineIdx(parseInt(e.target.value, 10))}
+                        style={{ fontFamily: editableUiFontFamily }}
+                        className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-2 py-1.5 text-xs text-zinc-100 focus:border-amber-400 focus:outline-none"
+                      >
+                        <option value={-1}>
+                          🤖 Auto-Detect from Song Voice (හඬ අනුව Auto හඳුනාගන්න)
+                        </option>
+                        {manualLyrics
+                          .split("\n")
+                          .map((l) => l.trim())
+                          .filter((l) => l && !(l.startsWith("[") && l.endsWith("]")))
+                          .map((lnText, lIdx) => (
+                            <option key={lIdx} value={lIdx}>
+                              Line #{lIdx + 1}: {lnText}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                  )}
                   <div className="flex gap-2">
                     <button
                       type="button"
                       disabled={isSyncingLyrics || isFetchingSong}
-                      onClick={() => handleAutoSyncLyricsToAudio("manual")}
+                      onClick={() =>
+                        handleAutoSyncLyricsToAudio("manual", manualLyrics, selectedStartLineIdx)
+                      }
                       className="flex-1 rounded-xl bg-emerald-400 py-2.5 text-xs font-extrabold text-black hover:bg-emerald-300 disabled:opacity-40"
                     >
                       {isSyncingLyrics || isFetchingSong
                         ? "Syncing to Song Vocals..."
-                        : "⚡ Sync Manual Captions to Song Vocals"}
+                        : selectedStartLineIdx >= 0
+                          ? `⚡ Sync Captions from Line #${selectedStartLineIdx + 1}`
+                          : "⚡ Sync Manual Captions to Song Vocals"}
                     </button>
                     {isFetchingSong || isSyncingLyrics ? (
                       <button
@@ -4770,13 +5371,12 @@ export default function TikTokLyricsVideoEditor() {
                     </span>
                     {activeFontEntry?.style_tag && (
                       <span
-                        className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${
-                          activeFontEntry.encoding === "wijesekara_fm"
-                            ? "border-violet-400/50 bg-violet-500/15 font-semibold text-violet-300"
-                            : activeFontEntry.encoding === "isi"
+                        className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${activeFontEntry.encoding === "wijesekara_fm"
+                          ? "border-violet-400/50 bg-violet-500/15 font-semibold text-violet-300"
+                          : activeFontEntry.encoding === "isi"
                             ? "border-rose-400/50 bg-rose-500/15 font-semibold text-rose-300"
                             : "border-zinc-700 bg-zinc-800 text-zinc-300"
-                        }`}
+                          }`}
                       >
                         {activeFontEntry.style_tag}
                       </span>
@@ -4870,11 +5470,10 @@ export default function TikTokLyricsVideoEditor() {
                     <button
                       type="button"
                       onClick={() => setShowServerFontRender((prev) => !prev)}
-                      className={`rounded-lg border px-2 py-1.5 text-[10px] font-bold transition ${
-                        showServerFontRender
-                          ? "border-emerald-400/50 bg-emerald-400/15 text-emerald-300"
-                          : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white"
-                      }`}
+                      className={`rounded-lg border px-2 py-1.5 text-[10px] font-bold transition ${showServerFontRender
+                        ? "border-emerald-400/50 bg-emerald-400/15 text-emerald-300"
+                        : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white"
+                        }`}
                       title="Toggle 100% real FFmpeg libass server-rendered frame preview"
                     >
                       🎬 FFmpeg Frame
@@ -4892,11 +5491,10 @@ export default function TikTokLyricsVideoEditor() {
                         key={phrase}
                         type="button"
                         onClick={() => setFontPreviewSampleText(phrase)}
-                        className={`rounded-md px-2 py-0.5 text-[10px] transition ${
-                          fontPreviewSampleText === phrase
-                            ? "bg-amber-400 text-black font-bold"
-                            : "bg-zinc-800/80 text-zinc-300 hover:bg-zinc-700"
-                        }`}
+                        className={`rounded-md px-2 py-0.5 text-[10px] transition ${fontPreviewSampleText === phrase
+                          ? "bg-amber-400 text-black font-bold"
+                          : "bg-zinc-800/80 text-zinc-300 hover:bg-zinc-700"
+                          }`}
                       >
                         {phrase}
                       </button>
@@ -4957,15 +5555,14 @@ export default function TikTokLyricsVideoEditor() {
                             handleSelectFont(f);
                           }
                         }}
-                        className={`group w-full cursor-pointer rounded-xl border p-2.5 text-left transition-all ${
-                          isSelected
-                            ? "border-amber-400 bg-amber-400/12 shadow-md shadow-amber-400/10"
-                            : isNew
+                        className={`group w-full cursor-pointer rounded-xl border p-2.5 text-left transition-all ${isSelected
+                          ? "border-amber-400 bg-amber-400/12 shadow-md shadow-amber-400/10"
+                          : isNew
                             ? "border-emerald-400/70 bg-emerald-500/10 ring-1 ring-emerald-400/25 hover:border-emerald-300 hover:bg-emerald-500/15"
                             : isStarred
-                            ? "border-amber-500/40 bg-amber-500/5 hover:border-amber-400/70 hover:bg-zinc-900"
-                            : "border-zinc-800/90 bg-zinc-950/90 hover:border-zinc-600 hover:bg-zinc-900"
-                        }`}
+                              ? "border-amber-500/40 bg-amber-500/5 hover:border-amber-400/70 hover:bg-zinc-900"
+                              : "border-zinc-800/90 bg-zinc-950/90 hover:border-zinc-600 hover:bg-zinc-900"
+                          }`}
                       >
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex items-center gap-1.5 min-w-0">
@@ -4976,24 +5573,22 @@ export default function TikTokLyricsVideoEditor() {
                                 toggleStarFont(f.family);
                               }}
                               title={isStarred ? "Unstar font" : "Star font (pin to top of list)"}
-                              className={`shrink-0 rounded-md p-0.5 transition ${
-                                isStarred
-                                  ? "text-amber-400 hover:text-amber-300"
-                                  : "text-zinc-500 hover:text-amber-300"
-                              }`}
+                              className={`shrink-0 rounded-md p-0.5 transition ${isStarred
+                                ? "text-amber-400 hover:text-amber-300"
+                                : "text-zinc-500 hover:text-amber-300"
+                                }`}
                             >
                               <Star
                                 className={`h-3.5 w-3.5 ${isStarred ? "fill-amber-400" : ""}`}
                               />
                             </button>
                             <span
-                              className={`truncate text-xs font-bold ${
-                                isSelected
-                                  ? "text-amber-300"
-                                  : isNew
+                              className={`truncate text-xs font-bold ${isSelected
+                                ? "text-amber-300"
+                                : isNew
                                   ? "text-emerald-200 group-hover:text-white"
                                   : "text-zinc-200 group-hover:text-white"
-                              }`}
+                                }`}
                             >
                               {f.family}
                             </span>
@@ -5004,13 +5599,12 @@ export default function TikTokLyricsVideoEditor() {
                             )}
                             {f.style_tag && (
                               <span
-                                className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium ${
-                                  f.encoding === "wijesekara_fm"
-                                    ? "border border-violet-400/35 bg-violet-500/15 text-violet-300"
-                                    : f.encoding === "isi"
+                                className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium ${f.encoding === "wijesekara_fm"
+                                  ? "border border-violet-400/35 bg-violet-500/15 text-violet-300"
+                                  : f.encoding === "isi"
                                     ? "border border-rose-400/35 bg-rose-500/15 text-rose-300"
                                     : "bg-zinc-800 text-zinc-400"
-                                }`}
+                                  }`}
                               >
                                 {f.style_tag}
                               </span>
@@ -5018,11 +5612,10 @@ export default function TikTokLyricsVideoEditor() {
                           </div>
                           <div className="flex shrink-0 items-center gap-1.5">
                             <span
-                              className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold ${
-                                isSelected
-                                  ? "bg-amber-400 text-black"
-                                  : "border border-zinc-700 bg-zinc-900 text-zinc-400 group-hover:border-amber-400/50 group-hover:text-amber-300"
-                              }`}
+                              className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold ${isSelected
+                                ? "bg-amber-400 text-black"
+                                : "border border-zinc-700 bg-zinc-900 text-zinc-400 group-hover:border-amber-400/50 group-hover:text-amber-300"
+                                }`}
                             >
                               {isSelected ? "✓ Active" : "Preview"}
                             </span>
@@ -5050,8 +5643,8 @@ export default function TikTokLyricsVideoEditor() {
                             fontWeight: f.family.toLowerCase().includes("regular")
                               ? 400
                               : boldText
-                              ? 700
-                              : 400,
+                                ? 700
+                                : 400,
                             fontStyle: italicText ? "italic" : "normal",
                           }}
                         >
@@ -5113,11 +5706,10 @@ export default function TikTokLyricsVideoEditor() {
                               handleDownloadFont(item.id);
                             }
                           }}
-                          className={`flex items-center justify-between rounded-lg border px-2.5 py-1.5 text-left transition ${
-                            isCurrent
-                              ? "border-amber-400 bg-amber-400/15 text-amber-200"
-                              : "border-zinc-800 bg-zinc-900 text-zinc-200 hover:border-amber-400/60"
-                          }`}
+                          className={`flex items-center justify-between rounded-lg border px-2.5 py-1.5 text-left transition ${isCurrent
+                            ? "border-amber-400 bg-amber-400/15 text-amber-200"
+                            : "border-zinc-800 bg-zinc-900 text-zinc-200 hover:border-amber-400/60"
+                            }`}
                         >
                           <div className="min-w-0">
                             <div className="truncate text-[11px] font-semibold">
@@ -5429,11 +6021,10 @@ export default function TikTokLyricsVideoEditor() {
                             setWatermarkPosXPercent(pos.x);
                             setWatermarkPosYPercent(pos.y);
                           }}
-                          className={`rounded-md border px-1.5 py-1 text-[10px] font-semibold transition ${
-                            active
-                              ? "border-amber-400 bg-amber-400/20 text-amber-300"
-                              : "border-zinc-800 bg-zinc-950 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
-                          }`}
+                          className={`rounded-md border px-1.5 py-1 text-[10px] font-semibold transition ${active
+                            ? "border-amber-400 bg-amber-400/20 text-amber-300"
+                            : "border-zinc-800 bg-zinc-950 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+                            }`}
                         >
                           {pos.label}
                         </button>
@@ -5470,13 +6061,13 @@ export default function TikTokLyricsVideoEditor() {
                       <span className="font-mono font-bold text-amber-400">
                         {Math.round(fontBrightness * 100)}%
                       </span>
-                      {fontBrightness !== 1.0 && (
+                      {Math.abs(fontBrightness - 1.35) > 0.02 && (
                         <button
                           type="button"
-                          onClick={() => setFontBrightness(1.0)}
+                          onClick={() => setFontBrightness(1.35)}
                           className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.2 text-[9px] text-zinc-400 hover:border-amber-400 hover:text-amber-300"
                         >
-                          Reset
+                          Reset (135%)
                         </button>
                       )}
                     </div>
@@ -5504,11 +6095,10 @@ export default function TikTokLyricsVideoEditor() {
                           key={preset.label}
                           type="button"
                           onClick={() => setFontBrightness(preset.val)}
-                          className={`rounded border py-0.5 text-[10px] font-semibold transition ${
-                            active
-                              ? "border-amber-400 bg-amber-400/20 text-amber-300"
-                              : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200"
-                          }`}
+                          className={`rounded border py-0.5 text-[10px] font-semibold transition ${active
+                            ? "border-amber-400 bg-amber-400/20 text-amber-300"
+                            : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200"
+                            }`}
                         >
                           {preset.label}
                         </button>
@@ -5538,11 +6128,11 @@ export default function TikTokLyricsVideoEditor() {
                     <span className="font-semibold text-zinc-300">
                       🎬 Video Only Color &amp; Brightness (Without Captions)
                     </span>
-                    {(brightness !== 0 || contrast !== 1 || saturation !== 1) && (
+                    {(Math.abs(brightness - -0.3) > 0.02 || contrast !== 1 || saturation !== 1) && (
                       <button
                         type="button"
                         onClick={() => {
-                          setBrightness(0);
+                          setBrightness(-0.3);
                           setContrast(1);
                           setSaturation(1);
                         }}
@@ -5692,9 +6282,8 @@ export default function TikTokLyricsVideoEditor() {
 
               <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
                 <div
-                  className={`h-full transition-all duration-500 ${
-                    job?.stage === "failed" ? "bg-red-500" : "bg-amber-400"
-                  }`}
+                  className={`h-full transition-all duration-500 ${job?.stage === "failed" ? "bg-red-500" : "bg-amber-400"
+                    }`}
                   style={{ width: `${job ? job.progress : 0}%` }}
                 />
               </div>
@@ -5797,22 +6386,20 @@ export default function TikTokLyricsVideoEditor() {
                   return (
                     <div
                       key={step.id}
-                      className={`flex items-start gap-2.5 rounded-xl border p-2.5 text-xs ${
-                        isCurrent
-                          ? "border-amber-400/50 bg-amber-400/5"
-                          : isDone
+                      className={`flex items-start gap-2.5 rounded-xl border p-2.5 text-xs ${isCurrent
+                        ? "border-amber-400/50 bg-amber-400/5"
+                        : isDone
                           ? "border-emerald-500/30 bg-emerald-500/5"
                           : "border-zinc-800/60 bg-zinc-950/40 opacity-60"
-                      }`}
+                        }`}
                     >
                       <span
-                        className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
-                          isDone
-                            ? "bg-emerald-500 text-black"
-                            : isCurrent
+                        className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${isDone
+                          ? "bg-emerald-500 text-black"
+                          : isCurrent
                             ? "bg-amber-400 text-black animate-pulse"
                             : "bg-zinc-800 text-zinc-400"
-                        }`}
+                          }`}
                       >
                         {isDone ? "✓" : index + 1}
                       </span>
@@ -5838,209 +6425,217 @@ export default function TikTokLyricsVideoEditor() {
               return true;
             });
             return (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <h2 className="text-sm font-bold text-white">🎬 Videos &amp; Drafts</h2>
-                  <p className="text-[11px] text-zinc-400">
-                    Final videos &amp; drafts saved in your Downloads folder.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => fetchRenderedVideos()}
-                  disabled={isLoadingRenderedVideos}
-                  className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-semibold text-zinc-200 hover:border-amber-400 hover:text-amber-300 disabled:opacity-50"
-                >
-                  {isLoadingRenderedVideos ? "..." : "↻ Refresh"}
-                </button>
-              </div>
-
-              <div className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900/70 p-1">
-                {(
-                  [
-                    { id: "all", label: `All (${renderedVideos.length})` },
-                    { id: "final", label: `Final (${finalCount})` },
-                    { id: "draft", label: `📝 Drafts (${draftCount})` },
-                  ] as const
-                ).map((flt) => (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-sm font-bold text-white">🎬 Videos &amp; Drafts</h2>
+                    <p className="text-[11px] text-zinc-400">
+                      Final videos &amp; drafts saved in your Downloads folder.
+                    </p>
+                  </div>
                   <button
-                    key={flt.id}
                     type="button"
-                    onClick={() => setVideoLibraryFilter(flt.id)}
-                    className={`flex-1 rounded-lg px-2 py-1 text-[11px] font-bold transition ${
-                      videoLibraryFilter === flt.id
+                    onClick={() => fetchRenderedVideos()}
+                    disabled={isLoadingRenderedVideos}
+                    className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-semibold text-zinc-200 hover:border-amber-400 hover:text-amber-300 disabled:opacity-50"
+                  >
+                    {isLoadingRenderedVideos ? "..." : "↻ Refresh"}
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900/70 p-1">
+                  {(
+                    [
+                      { id: "all", label: `All (${renderedVideos.length})` },
+                      { id: "final", label: `Final (${finalCount})` },
+                      { id: "draft", label: `📝 Drafts (${draftCount})` },
+                    ] as const
+                  ).map((flt) => (
+                    <button
+                      key={flt.id}
+                      type="button"
+                      onClick={() => setVideoLibraryFilter(flt.id)}
+                      className={`flex-1 rounded-lg px-2 py-1 text-[11px] font-bold transition ${videoLibraryFilter === flt.id
                         ? flt.id === "draft"
                           ? "bg-violet-500 text-white"
                           : "bg-amber-400 text-black"
                         : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    {flt.label}
-                  </button>
-                ))}
-              </div>
+                        }`}
+                    >
+                      {flt.label}
+                    </button>
+                  ))}
+                </div>
 
-              <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-2.5 text-[11px] text-emerald-200 space-y-1.5">
-                <div>
-                  <div className="flex items-center gap-1.5 font-bold">
-                    <FolderOpen className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
-                    Original Videos Folder
+                <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-2.5 text-[11px] text-emerald-200 space-y-1.5">
+                  <div>
+                    <div className="flex items-center gap-1.5 font-bold">
+                      <FolderOpen className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                      Original Videos Folder
+                    </div>
+                    <div className="mt-0.5 break-all font-mono text-[10px] text-emerald-300/90">
+                      {renderedVideosFolder}
+                    </div>
                   </div>
-                  <div className="mt-0.5 break-all font-mono text-[10px] text-emerald-300/90">
-                    {renderedVideosFolder}
+                  <div className="border-t border-emerald-500/20 pt-1.5">
+                    <div className="flex items-center gap-1.5 font-bold text-violet-300">
+                      <FolderOpen className="h-3.5 w-3.5 text-violet-400 shrink-0" />
+                      Drafts Folder
+                    </div>
+                    <div className="mt-0.5 break-all font-mono text-[10px] text-violet-300/90">
+                      {draftsFolder}
+                    </div>
                   </div>
                 </div>
-                <div className="border-t border-emerald-500/20 pt-1.5">
-                  <div className="flex items-center gap-1.5 font-bold text-violet-300">
-                    <FolderOpen className="h-3.5 w-3.5 text-violet-400 shrink-0" />
-                    Drafts Folder
-                  </div>
-                  <div className="mt-0.5 break-all font-mono text-[10px] text-violet-300/90">
-                    {draftsFolder}
-                  </div>
-                </div>
-              </div>
 
-              {visibleVideos.length === 0 ? (
-                <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 p-6 text-center text-xs text-zinc-400">
-                  {videoLibraryFilter === "draft" ? (
-                    <>
-                      No draft videos yet. Click{" "}
-                      <span className="font-bold text-violet-300">Save Draft</span> to save a draft
-                      into <span className="font-mono text-zinc-300">draft</span> folder.
-                    </>
-                  ) : (
-                    <>
-                      No rendered videos yet. Click{" "}
-                      <span className="font-bold text-amber-300">Render Video</span> or{" "}
-                      <span className="font-bold text-violet-300">Save Draft</span> to create your
-                      first MP4.
-                    </>
-                  )}
-                </div>
-              ) : (
-                <div className="space-y-2.5">
-                  {visibleVideos.map((vid) => {
-                    const isDraftItem = Boolean(vid.is_draft || vid.location === "draft");
-                    const isPromoting = promotingDraftFilename === vid.filename;
-                    const isPlayingOnStage =
-                      activeRenderedPlaybackUrl === vid.stream_url ||
-                      selectedRenderedVideoUrl === vid.stream_url;
-                    return (
-                      <div
-                        key={vid.id}
-                        className={`flex gap-2.5 overflow-hidden rounded-xl border p-2.5 transition ${
-                          isPlayingOnStage
+                {visibleVideos.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 p-6 text-center text-xs text-zinc-400">
+                    {videoLibraryFilter === "draft" ? (
+                      <>
+                        No draft videos yet. Click{" "}
+                        <span className="font-bold text-violet-300">Save Draft</span> to save a draft
+                        into <span className="font-mono text-zinc-300">draft</span> folder.
+                      </>
+                    ) : (
+                      <>
+                        No rendered videos yet. Click{" "}
+                        <span className="font-bold text-amber-300">Render Video</span> or{" "}
+                        <span className="font-bold text-violet-300">Save Draft</span> to create your
+                        first MP4.
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {visibleVideos.map((vid) => {
+                      const isDraftItem = Boolean(vid.is_draft || vid.location === "draft");
+                      const isPromoting = promotingDraftFilename === vid.filename;
+                      const isPlayingOnStage =
+                        activeRenderedPlaybackUrl === vid.stream_url ||
+                        selectedRenderedVideoUrl === vid.stream_url;
+                      return (
+                        <div
+                          key={vid.id}
+                          className={`flex gap-2.5 overflow-hidden rounded-xl border p-2.5 transition ${isPlayingOnStage
                             ? "border-emerald-400 bg-emerald-500/10"
                             : isDraftItem
-                            ? "border-violet-500/40 bg-violet-950/20 hover:border-violet-400/60"
-                            : "border-zinc-800 bg-zinc-950/90 hover:border-zinc-700"
-                        }`}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => playRenderedVideoInStage(vid.stream_url, vid.filename)}
-                          title="Preview MP4 in Stage"
-                          className="group relative aspect-[9/16] w-14 shrink-0 overflow-hidden rounded-lg border border-zinc-800 bg-black"
+                              ? "border-violet-500/40 bg-violet-950/20 hover:border-violet-400/60"
+                              : "border-zinc-800 bg-zinc-950/90 hover:border-zinc-700"
+                            }`}
                         >
-                          <video
-                            src={`${API_BASE}${vid.stream_url}#t=0.4`}
-                            preload="metadata"
-                            muted
-                            playsInline
-                            onMouseEnter={(e) => {
-                              e.currentTarget.play().catch(() => {});
-                            }}
-                            onMouseLeave={(e) => {
-                              e.currentTarget.pause();
-                            }}
-                            className="h-full w-full object-cover"
-                          />
-                          <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35 opacity-85 transition group-hover:bg-black/15">
-                            <Play className="h-4 w-4 fill-white text-white drop-shadow" />
-                          </span>
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => playRenderedVideoInStage(vid.stream_url, vid.filename)}
+                            title="Preview MP4 in Stage"
+                            className="group relative aspect-[9/16] w-14 shrink-0 overflow-hidden rounded-lg border border-zinc-800 bg-black"
+                          >
+                            <video
+                              src={`${API_BASE}${vid.stream_url}#t=0.4`}
+                              preload="metadata"
+                              muted
+                              playsInline
+                              onMouseEnter={(e) => {
+                                e.currentTarget.play().catch(() => { });
+                              }}
+                              onMouseLeave={(e) => {
+                                e.currentTarget.pause();
+                              }}
+                              className="h-full w-full object-cover"
+                            />
+                            <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35 opacity-85 transition group-hover:bg-black/15">
+                              <Play className="h-4 w-4 fill-white text-white drop-shadow" />
+                            </span>
+                          </button>
 
-                        <div className="min-w-0 flex-1 flex flex-col justify-between">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-1.5">
-                                {isDraftItem && (
-                                  <span className="shrink-0 rounded bg-violet-500/30 px-1.5 py-0.5 text-[9px] font-extrabold uppercase tracking-wider text-violet-200 ring-1 ring-violet-400/40">
-                                    Draft
-                                  </span>
-                                )}
-                                <div className="truncate text-xs font-bold text-white" title={vid.filename}>
-                                  {vid.filename}
+                          <div className="min-w-0 flex-1 flex flex-col justify-between">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5">
+                                  {isDraftItem && (
+                                    <span className="shrink-0 rounded bg-violet-500/30 px-1.5 py-0.5 text-[9px] font-extrabold uppercase tracking-wider text-violet-200 ring-1 ring-violet-400/40">
+                                      Draft
+                                    </span>
+                                  )}
+                                  <div className="truncate text-xs font-bold text-white" title={vid.filename}>
+                                    {vid.filename}
+                                  </div>
+                                </div>
+                                <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-400">
+                                  <span>{vid.size_mb} MB</span>
+                                  <span>•</span>
+                                  <span>{vid.created_label}</span>
+                                  {isDraftItem ? (
+                                    <span className="rounded bg-violet-500/20 px-1.5 py-0.2 font-semibold text-violet-300">
+                                      📁 draft
+                                    </span>
+                                  ) : vid.saved_in_downloads ? (
+                                    <span className="rounded bg-emerald-500/20 px-1.5 py-0.2 font-semibold text-emerald-300">
+                                      ✓ Downloads
+                                    </span>
+                                  ) : null}
                                 </div>
                               </div>
-                              <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-400">
-                                <span>{vid.size_mb} MB</span>
-                                <span>•</span>
-                                <span>{vid.created_label}</span>
-                                {isDraftItem ? (
-                                  <span className="rounded bg-violet-500/20 px-1.5 py-0.2 font-semibold text-violet-300">
-                                    📁 draft
-                                  </span>
-                                ) : vid.saved_in_downloads ? (
-                                  <span className="rounded bg-emerald-500/20 px-1.5 py-0.2 font-semibold text-emerald-300">
-                                    ✓ Downloads
-                                  </span>
-                                ) : null}
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteRenderedVideo(vid)}
-                              title={isDraftItem ? "Delete draft video" : "Delete rendered video"}
-                              className="shrink-0 rounded-lg border border-zinc-800 p-1.5 text-zinc-500 hover:border-red-500/40 hover:bg-red-500/10 hover:text-red-300"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-
-                          <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => playRenderedVideoInStage(vid.stream_url, vid.filename)}
-                              className={`flex-1 inline-flex items-center justify-center gap-1 rounded-lg px-2.5 py-1.5 text-[11px] font-bold transition ${
-                                isPlayingOnStage
-                                  ? "bg-emerald-400 text-black"
-                                  : "border border-amber-400/40 bg-amber-400/15 text-amber-300 hover:bg-amber-400/25"
-                              }`}
-                            >
-                              <Play className="h-3 w-3 fill-current" />
-                              {isPlayingOnStage ? "Playing" : "Play"}
-                            </button>
-                            {isDraftItem && (
                               <button
                                 type="button"
-                                disabled={isPromoting}
-                                onClick={() => handlePromoteDraft(vid)}
-                                title="Remove from draft folder and save to original videos folder"
-                                className="flex-1 inline-flex items-center justify-center gap-1 rounded-lg bg-gradient-to-r from-amber-400 to-orange-400 px-2.5 py-1.5 text-[11px] font-extrabold text-black transition hover:brightness-105 disabled:opacity-50"
+                                onClick={() => handleDeleteRenderedVideo(vid)}
+                                title={isDraftItem ? "Delete draft video" : "Delete rendered video"}
+                                className="shrink-0 rounded-lg border border-zinc-800 p-1.5 text-zinc-500 hover:border-red-500/40 hover:bg-red-500/10 hover:text-red-300"
                               >
-                                <Rocket className="h-3 w-3" />
-                                {isPromoting ? "Moving..." : "Render Draft"}
+                                <Trash2 className="h-3.5 w-3.5" />
                               </button>
-                            )}
-                            <a
-                              href={`${API_BASE}${vid.download_url}`}
-                              download={vid.filename}
-                              className="inline-flex items-center justify-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-200 hover:border-emerald-400 hover:text-emerald-300"
-                            >
-                              <Download className="h-3 w-3" />
-                              MP4
-                            </a>
+                            </div>
+
+                            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={loadingDraftFilename === vid.filename}
+                                  onClick={() => handleLoadDraftForReEdit(vid)}
+                                  title="Load this draft's settings, lyrics, song & video clips back into the editor to re-edit"
+                                  className="flex-1 inline-flex items-center justify-center gap-1 rounded-lg border border-violet-400/50 bg-violet-500/20 px-2.5 py-1.5 text-[11px] font-extrabold text-violet-200 transition hover:bg-violet-500/35 disabled:opacity-50"
+                                >
+                                  <Wand2 className="h-3 w-3" />
+                                  {loadingDraftFilename === vid.filename ? "Loading..." : "✏️ Re-Edit"}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isPromoting}
+                                  onClick={() => handlePromoteDraft(vid)}
+                                  title="Remove from draft folder and save to original videos folder"
+                                  className="flex-1 inline-flex items-center justify-center gap-1 rounded-lg bg-gradient-to-r from-amber-400 to-orange-400 px-2.5 py-1.5 text-[11px] font-extrabold text-black transition hover:brightness-105 disabled:opacity-50"
+                                >
+                                  <Rocket className="h-3 w-3" />
+                                  {isPromoting ? "Moving..." : "Render Draft"}
+                                </button>
+                              </>
+                              {isDraftItem && (
+                                <button
+                                  type="button"
+                                  disabled={isPromoting}
+                                  onClick={() => handlePromoteDraft(vid)}
+                                  title="Remove from draft folder and save to original videos folder"
+                                  className="flex-1 inline-flex items-center justify-center gap-1 rounded-lg bg-gradient-to-r from-amber-400 to-orange-400 px-2.5 py-1.5 text-[11px] font-extrabold text-black transition hover:brightness-105 disabled:opacity-50"
+                                >
+                                  <Rocket className="h-3 w-3" />
+                                  {isPromoting ? "Moving..." : "Render Draft"}
+                                </button>
+                              )}
+                              <a
+                                href={`${API_BASE}${vid.download_url}`}
+                                download={vid.filename}
+                                className="inline-flex items-center justify-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-200 hover:border-emerald-400 hover:text-emerald-300"
+                              >
+                                <Download className="h-3 w-3" />
+                                MP4
+                              </a>
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             );
           })()}
         </aside>
@@ -6048,9 +6643,8 @@ export default function TikTokLyricsVideoEditor() {
         {/* 3. CENTER VIDEO PREVIEW STAGE (WITH FULLSCREEN & TRANSPORT BAR) */}
         <main
           ref={previewStageRef}
-          className={`nle-stage-grid flex flex-1 flex-col items-center justify-between bg-zinc-950 p-3 sm:p-4 ${
-            isFullscreenModal ? "fixed inset-0 z-50 bg-black p-6" : " relative overflow-hidden"
-          }`}
+          className={`nle-stage-grid flex flex-1 flex-col items-center justify-between bg-zinc-950 p-3 sm:p-4 ${isFullscreenModal ? "fixed inset-0 z-50 bg-black p-6" : " relative overflow-hidden"
+            }`}
         >
           {/* Preview Top Bar: Mode Switcher + Monitor Telemetry + Safe Zone + Fullscreen Controls */}
           <div className="z-10 flex w-full max-w-3xl flex-wrap items-center justify-between gap-2 rounded-2xl border border-zinc-800/80 bg-zinc-950/85 px-3 py-1.5 shadow-lg backdrop-blur-md">
@@ -6058,11 +6652,10 @@ export default function TikTokLyricsVideoEditor() {
               <button
                 type="button"
                 onClick={() => setActivePreviewTab("canvas")}
-                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1 text-xs font-semibold transition ${
-                  activePreviewTab === "canvas"
-                    ? "bg-amber-400 text-black shadow-sm"
-                    : "text-zinc-400 hover:text-white"
-                }`}
+                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1 text-xs font-semibold transition ${activePreviewTab === "canvas"
+                  ? "bg-amber-400 text-black shadow-sm"
+                  : "text-zinc-400 hover:text-white"
+                  }`}
               >
                 <Smartphone className="h-3.5 w-3.5" />
                 9:16 Live Canvas
@@ -6075,11 +6668,10 @@ export default function TikTokLyricsVideoEditor() {
                   setActivePreviewTab("rendered");
                 }}
                 disabled={!activeRenderedPlaybackUrl}
-                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1 text-xs font-semibold transition ${
-                  activePreviewTab === "rendered"
-                    ? "bg-emerald-400 text-black shadow-sm"
-                    : "text-zinc-400 hover:text-white disabled:opacity-40"
-                }`}
+                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1 text-xs font-semibold transition ${activePreviewTab === "rendered"
+                  ? "bg-emerald-400 text-black shadow-sm"
+                  : "text-zinc-400 hover:text-white disabled:opacity-40"
+                  }`}
               >
                 <Film className="h-3.5 w-3.5" />
                 Rendered MP4 {activeRenderedPlaybackUrl ? "✓" : ""}
@@ -6108,11 +6700,10 @@ export default function TikTokLyricsVideoEditor() {
                 type="button"
                 onClick={() => setShowTikTokSafeZone((prev) => !prev)}
                 title="Toggle TikTok UI Safe-Zone Guide (won't appear in export)"
-                className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-xs font-semibold transition ${
-                  showTikTokSafeZone
-                    ? "border-sky-400/50 bg-sky-400/15 text-sky-300"
-                    : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white"
-                }`}
+                className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-xs font-semibold transition ${showTikTokSafeZone
+                  ? "border-sky-400/50 bg-sky-400/15 text-sky-300"
+                  : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white"
+                  }`}
               >
                 <ShieldCheck className="h-3.5 w-3.5" />
                 Safe Zone
@@ -6158,13 +6749,11 @@ export default function TikTokLyricsVideoEditor() {
                 }}
                 onDragLeave={() => setIsDraggingClip(false)}
                 onDrop={handleDropClips}
-                className={`relative flex aspect-[9/16] flex-col items-center justify-center overflow-hidden rounded-[26px] border bg-black shadow-2xl transition-all ${
-                  isDraggingClip ? "border-amber-400 ring-2 ring-amber-400/40" : "border-zinc-800"
-                } ${
-                  isFullscreenModal
+                className={`relative flex aspect-[9/16] flex-col items-center justify-center overflow-hidden rounded-[26px] border bg-black shadow-2xl transition-all ${isDraggingClip ? "border-amber-400 ring-2 ring-amber-400/40" : "border-zinc-800"
+                  } ${isFullscreenModal
                     ? "h-[80vh] max-h-[820px]"
                     : "h-full max-h-[430px] xl:max-h-[500px]"
-                }`}
+                  }`}
               >
                 <div
                   ref={previewCardRef}
@@ -6175,14 +6764,13 @@ export default function TikTokLyricsVideoEditor() {
                       frameLayout === "rounded_square_card"
                         ? "1 / 1"
                         : frameLayout === "rounded_portrait_card"
-                        ? "4 / 5"
-                        : "9 / 16",
+                          ? "4 / 5"
+                          : "9 / 16",
                     height: frameLayout === "fullscreen_vertical" ? "100%" : "auto",
-                    borderRadius: `${
-                      frameLayout === "fullscreen_vertical"
-                        ? 0
-                        : Math.round(cornerRadius * liveCanvasScale)
-                    }px`,
+                    borderRadius: `${frameLayout === "fullscreen_vertical"
+                      ? 0
+                      : Math.round(cornerRadius * liveCanvasScale)
+                      }px`,
                   }}
                 >
                   {previewClipUrl ? (
@@ -6200,14 +6788,17 @@ export default function TikTokLyricsVideoEditor() {
                         }
                       }}
                       onTimeUpdate={(e) => {
-                        if (videoSegments.length === 0) return;
+                        if (visualClips.length > 1 && selectedSingleClipIdx === null) return;
+                        if (effectiveVideoSegments.length === 0) return;
+                        if (videoSegments.length === 0 && clipTrimStart <= 0 && clipTrimEnd <= 0) return;
                         const t = e.currentTarget.currentTime;
-                        const inAnySeg = videoSegments.some(
+                        const inAnySeg = effectiveVideoSegments.some(
                           (s) => t >= s.start - 0.08 && t <= s.end + 0.08
                         );
                         if (!inAnySeg) {
                           const nextSeg =
-                            videoSegments.find((s) => s.start > t) || videoSegments[0];
+                            effectiveVideoSegments.find((s) => s.start > t) ||
+                            effectiveVideoSegments[0];
                           if (nextSeg) {
                             e.currentTarget.currentTime = nextSeg.start;
                           }
@@ -6278,10 +6869,10 @@ export default function TikTokLyricsVideoEditor() {
                           activeSyncedLine.words && activeSyncedLine.words.length > 0
                             ? activeSyncedLine.words
                             : buildWordTimingsForLine(
-                                activeSyncedLine.text,
-                                activeSyncedLine.start,
-                                activeSyncedLine.end
-                              );
+                              activeSyncedLine.text,
+                              activeSyncedLine.start,
+                              activeSyncedLine.end
+                            );
                         const relMs =
                           (currentAudioTime -
                             (activeSyncedLine.start + lyricsOffsetSec)) *
@@ -6310,28 +6901,28 @@ export default function TikTokLyricsVideoEditor() {
                           >
                             {previewWords.length > 0
                               ? previewWords.map((wt, wIdx) => {
-                                  const wordAlpha =
-                                    relMs <= wt.start_ms
-                                      ? 0.08
-                                      : relMs >= wt.end_ms
+                                const wordAlpha =
+                                  relMs <= wt.start_ms
+                                    ? 0.08
+                                    : relMs >= wt.end_ms
                                       ? 1.0
                                       : (relMs - wt.start_ms) /
-                                        Math.max(wt.end_ms - wt.start_ms, 100);
-                                  return (
-                                    <span
-                                      key={wIdx}
-                                      style={{
-                                        opacity: Math.max(
-                                          0.05,
-                                          Math.min(1, wordAlpha * fadeOutAlpha)
-                                        ),
-                                        transition: "opacity 90ms linear",
-                                      }}
-                                    >
-                                      {formatActiveFontText(wt.word)}{" "}
-                                    </span>
-                                  );
-                                })
+                                      Math.max(wt.end_ms - wt.start_ms, 100);
+                                return (
+                                  <span
+                                    key={wIdx}
+                                    style={{
+                                      opacity: Math.max(
+                                        0.05,
+                                        Math.min(1, wordAlpha * fadeOutAlpha)
+                                      ),
+                                      transition: "opacity 90ms linear",
+                                    }}
+                                  >
+                                    {formatActiveFontText(wt.word)}{" "}
+                                  </span>
+                                );
+                              })
                               : formatActiveFontText(activeSyncedLine.text)}
                           </p>
                         );
@@ -6384,11 +6975,10 @@ export default function TikTokLyricsVideoEditor() {
                   </div>
                 )}
                 <div
-                  className={`relative flex aspect-[9/16] items-center justify-center overflow-hidden rounded-[26px] border border-zinc-800 bg-black shadow-2xl ${
-                    isFullscreenModal
-                      ? "h-[78vh] max-h-[820px]"
-                      : "h-full max-h-[410px] xl:max-h-[475px]"
-                  }`}
+                  className={`relative flex aspect-[9/16] items-center justify-center overflow-hidden rounded-[26px] border border-zinc-800 bg-black shadow-2xl ${isFullscreenModal
+                    ? "h-[78vh] max-h-[820px]"
+                    : "h-full max-h-[410px] xl:max-h-[475px]"
+                    }`}
                 >
                   {renderedVideoError ? (
                     <div className="flex flex-col items-center gap-2 p-4 text-center">
@@ -6400,7 +6990,7 @@ export default function TikTokLyricsVideoEditor() {
                           setRenderedVideoError(null);
                           if (renderedVideoRef.current) {
                             renderedVideoRef.current.load();
-                            renderedVideoRef.current.play().catch(() => {});
+                            renderedVideoRef.current.play().catch(() => { });
                           }
                         }}
                         className="rounded-lg bg-amber-400 px-3 py-1.5 text-[11px] font-bold text-black hover:bg-amber-300"
@@ -6418,7 +7008,7 @@ export default function TikTokLyricsVideoEditor() {
                       preload="metadata"
                       onLoadedMetadata={() => {
                         setRenderedVideoError(null);
-                        renderedVideoRef.current?.play().catch(() => {});
+                        renderedVideoRef.current?.play().catch(() => { });
                       }}
                       onError={() => {
                         if (
@@ -6521,11 +7111,10 @@ export default function TikTokLyricsVideoEditor() {
                 type="button"
                 onClick={() => setShowShortcutsHelp((prev) => !prev)}
                 title="Keyboard Shortcuts"
-                className={`rounded-lg border p-1.5 transition ${
-                  showShortcutsHelp
-                    ? "border-amber-400/50 bg-amber-400/15 text-amber-300"
-                    : "border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white"
-                }`}
+                className={`rounded-lg border p-1.5 transition ${showShortcutsHelp
+                  ? "border-amber-400/50 bg-amber-400/15 text-amber-300"
+                  : "border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white"
+                  }`}
               >
                 <Keyboard className="h-3.5 w-3.5" />
               </button>
@@ -6561,22 +7150,20 @@ export default function TikTokLyricsVideoEditor() {
               <button
                 type="button"
                 onClick={() => setTimelineViewMode("visual")}
-                className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${
-                  timelineViewMode === "visual"
-                    ? "bg-amber-400 text-black"
-                    : "text-zinc-400 hover:text-white"
-                }`}
+                className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${timelineViewMode === "visual"
+                  ? "bg-amber-400 text-black"
+                  : "text-zinc-400 hover:text-white"
+                  }`}
               >
                 📊 Visual Tracks
               </button>
               <button
                 type="button"
                 onClick={() => setTimelineViewMode("list")}
-                className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${
-                  timelineViewMode === "list"
-                    ? "bg-amber-400 text-black"
-                    : "text-zinc-400 hover:text-white"
-                }`}
+                className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${timelineViewMode === "list"
+                  ? "bg-amber-400 text-black"
+                  : "text-zinc-400 hover:text-white"
+                  }`}
               >
                 📝 Caption Timing Table ({editableTimeline.length})
               </button>
@@ -6628,11 +7215,10 @@ export default function TikTokLyricsVideoEditor() {
                   });
                 }}
                 title="Toggle Razor/Blade cursor mode — click directly on the Video Track to cut"
-                className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-bold transition disabled:opacity-40 ${
-                  isVideoBladeMode
-                    ? "bg-amber-400 text-black shadow"
-                    : "bg-zinc-900/90 text-sky-300 hover:bg-zinc-800"
-                }`}
+                className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-bold transition disabled:opacity-40 ${isVideoBladeMode
+                  ? "bg-amber-400 text-black shadow"
+                  : "bg-zinc-900/90 text-sky-300 hover:bg-zinc-800"
+                  }`}
               >
                 🔪 {isVideoBladeMode ? "Blade ON" : "Razor"}
               </button>
@@ -6713,22 +7299,22 @@ export default function TikTokLyricsVideoEditor() {
                   (rawSongDuration !== null &&
                     fetchedSongDuration !== null &&
                     fetchedSongDuration < rawSongDuration - 0.5)) && (
-                  <button
-                    type="button"
-                    disabled={isTrimmingSong || isFetchingSong}
-                    onClick={() => {
-                      setAudioStartSec(0);
-                      setAudioStartText("0:00");
-                      setAudioMaxDurationSec(0);
-                      handleTrimCachedSong(0, 0);
-                    }}
-                    title="Restore full song length from 0:00"
-                    className="inline-flex items-center gap-0.5 rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-300 hover:text-white disabled:opacity-50"
-                  >
-                    <RotateCcw className="h-2.5 w-2.5" />
-                    Full
-                  </button>
-                )}
+                    <button
+                      type="button"
+                      disabled={isTrimmingSong || isFetchingSong}
+                      onClick={() => {
+                        setAudioStartSec(0);
+                        setAudioStartText("0:00");
+                        setAudioMaxDurationSec(0);
+                        handleTrimCachedSong(0, 0);
+                      }}
+                      title="Restore full song length from 0:00"
+                      className="inline-flex items-center gap-0.5 rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-300 hover:text-white disabled:opacity-50"
+                    >
+                      <RotateCcw className="h-2.5 w-2.5" />
+                      Full
+                    </button>
+                  )}
               </div>
             )}
           </div>
@@ -6996,15 +7582,14 @@ export default function TikTokLyricsVideoEditor() {
                           seekAudioTo(line.start + lyricsOffsetSec);
                         }}
                         title={`${line.start}s -> ${line.end}s (Drag to move, drag edges to resize): ${line.text}`}
-                        className={`group absolute top-2 bottom-2 flex items-center overflow-hidden rounded-lg border px-2.5 py-1 text-[11px] select-none transition-colors ${
-                          isDraggingThis
-                            ? "z-30 cursor-grabbing border-white bg-amber-300 text-black font-bold shadow-xl ring-2 ring-amber-400/60"
-                            : isSelected
+                        className={`group absolute top-2 bottom-2 flex items-center overflow-hidden rounded-lg border px-2.5 py-1 text-[11px] select-none transition-colors ${isDraggingThis
+                          ? "z-30 cursor-grabbing border-white bg-amber-300 text-black font-bold shadow-xl ring-2 ring-amber-400/60"
+                          : isSelected
                             ? "z-20 cursor-grab border-white bg-amber-400 text-black font-bold shadow-lg"
                             : isPlayingNow
-                            ? "z-10 cursor-grab border-amber-400 bg-amber-400/25 text-white font-semibold"
-                            : "cursor-grab border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:border-amber-400"
-                        }`}
+                              ? "z-10 cursor-grab border-amber-400 bg-amber-400/25 text-white font-semibold"
+                              : "cursor-grab border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:border-amber-400"
+                          }`}
                         style={{
                           left: `${leftPct}%`,
                           width: `${widthPct}%`,
@@ -7077,14 +7662,24 @@ export default function TikTokLyricsVideoEditor() {
                   }
                   seekAudioTo(clickedSec);
                 }}
-                className={`relative flex h-12 items-center border-b border-zinc-800/80 bg-zinc-950/60 ${
-                  isVideoBladeMode ? "cursor-crosshair ring-1 ring-inset ring-amber-400/40" : "cursor-pointer"
-                }`}
+                className={`relative flex h-12 items-center border-b border-zinc-800/80 bg-zinc-950/60 ${isVideoBladeMode ? "cursor-crosshair ring-1 ring-inset ring-amber-400/40" : "cursor-pointer"
+                  }`}
               >
                 <div className="pointer-events-none sticky left-2 z-20 rounded bg-zinc-900/90 px-2 py-0.5 text-[10px] font-bold text-sky-300 border border-zinc-800">
-                  🎬 Video Track ({effectiveVideoSegments.length} part
-                  {effectiveVideoSegments.length > 1 ? "s" : ""} • {loopMode})
-                  {isVideoBladeMode ? " • 🔪 Click to Cut" : ""}
+                  🎬 Video Track (
+                  {visualClips.length > 1 && selectedSingleClipIdx === null
+                    ? `✨ Mixing & Blending ${visualClips.length} Clips`
+                    : selectedSingleClipIdx !== null
+                      ? `🔁 Repeating Clip #${selectedSingleClipIdx + 1}`
+                      : `${effectiveVideoSegments.length} part${effectiveVideoSegments.length > 1 ? "s" : ""
+                      }`}
+                  {" • "}
+                  {loopMode})
+                  {isVideoBladeMode
+                    ? " • 🔪 Click Video Bar to Cut"
+                    : effectiveVideoSegments.length > 1
+                      ? " • Click Part to Select & 🗑️ Delete"
+                      : ""}
                 </div>
 
                 {visualClips.length === 0 ? (
@@ -7109,61 +7704,79 @@ export default function TikTokLyricsVideoEditor() {
                         <div
                           key={`loop-${loopIdx}-seg-${segIdx}`}
                           onClick={(e) => {
-                            if (isVideoBladeMode) return;
                             e.stopPropagation();
+                            const segRect = e.currentTarget.getBoundingClientRect();
+                            const localRatio = Math.max(
+                              0,
+                              Math.min(1, (e.clientX - segRect.left) / Math.max(1, segRect.width))
+                            );
+                            const clickedTimelineSec = Number(
+                              (startSec + localRatio * (endSec - startSec)).toFixed(2)
+                            );
+                            const clickedSourceSec = Number(
+                              (seg.start + localRatio * (seg.end - seg.start)).toFixed(2)
+                            );
+                            if (isVideoBladeMode) {
+                              seekAudioTo(clickedTimelineSec);
+                              handleBladeVideoSegmentAtSourceTime(segIdx, clickedSourceSec);
+                              return;
+                            }
                             setSelectedVideoSegmentIdx(segIdx);
-                            seekAudioTo(startSec);
+                            seekAudioTo(clickedTimelineSec);
+                            if (previewVideoRef.current) {
+                              previewVideoRef.current.currentTime = clickedSourceSec;
+                            }
                           }}
                           title={`Video Part #${segIdx + 1} (${seg.start.toFixed(1)}s–${seg.end.toFixed(1)}s) • Click to select, ✂️ to split, or 🗑️ to delete`}
-                          className={`group absolute top-1.5 bottom-1.5 flex items-center justify-between overflow-hidden rounded-lg border px-2 text-[10px] transition ${
-                            isSelectedSeg
-                              ? "z-10 border-sky-300 bg-sky-500/30 text-white font-bold shadow-md"
+                          className={`group absolute top-1.5 bottom-1.5 flex items-center justify-between overflow-hidden rounded-lg border px-2 text-[10px] transition ${isVideoBladeMode
+                            ? "cursor-crosshair border-amber-400/80 bg-amber-500/20 text-amber-100 hover:bg-amber-500/30"
+                            : isSelectedSeg
+                              ? "z-10 border-amber-300 bg-sky-500/35 text-white font-bold shadow-md ring-1 ring-amber-300/60"
                               : "border-sky-500/40 bg-sky-500/15 text-sky-200 hover:border-sky-300"
-                          }`}
+                            }`}
                           style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
                         >
                           <span className="truncate">
-                            {loopIdx === 0
-                              ? `🎬 Part #${segIdx + 1}: ${seg.start.toFixed(1)}s–${seg.end.toFixed(1)}s`
-                              : `✨ Replay #${loopIdx + 1} (Part #${segIdx + 1})`}
+                            {visualClips.length > 1 && selectedSingleClipIdx === null
+                              ? `✨ Mix Clip #${((loopIdx + segIdx) % visualClips.length) + 1} (${visualClips[(loopIdx + segIdx) % visualClips.length]?.name || ""
+                              })`
+                              : selectedSingleClipIdx !== null
+                                ? `🔁 Clip #${selectedSingleClipIdx + 1} Replay #${loopIdx + 1}`
+                                : loopIdx === 0
+                                  ? `🎬 Part #${segIdx + 1}: ${seg.start.toFixed(1)}s–${seg.end.toFixed(1)}s`
+                                  : `✨ Replay #${loopIdx + 1} (Part #${segIdx + 1})`}
                           </span>
-                          <div className="flex items-center gap-1 shrink-0">
-                            {loopIdx === 0 && (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setSelectedVideoSegmentIdx(segIdx);
-                                    handleBladeVideoAtTime(startSec + segDur / 2);
-                                  }}
-                                  title="Split (Blade) this video part"
-                                  className="rounded bg-black/40 p-0.5 text-sky-200 hover:bg-sky-400 hover:text-black"
-                                >
-                                  <Scissors className="h-2.5 w-2.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleDeleteVideoSegment(segIdx);
-                                  }}
-                                  title={
-                                    effectiveVideoSegments.length > 1
-                                      ? "Delete this video part"
-                                      : "Delete main video clip"
-                                  }
-                                  className="rounded bg-black/40 p-0.5 text-red-300 hover:bg-red-500 hover:text-white"
-                                >
-                                  <Trash2 className="h-2.5 w-2.5" />
-                                </button>
-                              </>
-                            )}
-                            {loopIdx > 0 && (
-                              <span className="rounded bg-sky-400/20 px-1 text-[9px] text-sky-300">
-                                xfade
-                              </span>
-                            )}
+                          <div className="flex items-center gap-1 shrink-0 z-20">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedVideoSegmentIdx(segIdx);
+                                handleBladeVideoSegmentAtSourceTime(
+                                  segIdx,
+                                  (seg.start + seg.end) / 2
+                                );
+                              }}
+                              title="Split (Cut) this video part in half"
+                              className="rounded bg-black/60 px-1 py-0.5 text-[9px] font-bold text-sky-200 hover:bg-sky-400 hover:text-black"
+                            >
+                              ✂️ Cut
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDeleteVideoSegment(segIdx);
+                              }}
+                              title={
+                                effectiveVideoSegments.length > 1
+                                  ? `Delete Part #${segIdx + 1}`
+                                  : "Delete main video clip"
+                              }
+                              className="rounded bg-red-600/80 px-1 py-0.5 text-[9px] font-bold text-white hover:bg-red-500"
+                            >
+                              🗑️ Del
+                            </button>
                           </div>
                         </div>
                       );
@@ -7188,8 +7801,7 @@ export default function TikTokLyricsVideoEditor() {
 
                 {/* Continuous background FX layer */}
                 <div
-                  className={`pointer-events-none absolute inset-x-0 top-1.5 bottom-1.5 flex items-center justify-center rounded-md border text-[10px] ${
-                    blurInterval > 0 ||
+                  className={`pointer-events-none absolute inset-x-0 top-1.5 bottom-1.5 flex items-center justify-center rounded-md border text-[10px] ${blurInterval > 0 ||
                     colorGrade !== "original" ||
                     vignette ||
                     videoZoom > 1.01 ||
@@ -7198,9 +7810,9 @@ export default function TikTokLyricsVideoEditor() {
                     brightness !== 0 ||
                     contrast !== 1 ||
                     saturation !== 1
-                      ? "border-amber-500/25 bg-amber-500/5 text-amber-200/75"
-                      : "border-zinc-800/70 bg-zinc-900/30 text-zinc-500"
-                  }`}
+                    ? "border-amber-500/25 bg-amber-500/5 text-amber-200/75"
+                    : "border-zinc-800/70 bg-zinc-900/30 text-zinc-500"
+                    }`}
                 >
                   <span className="truncate px-36">
                     {activeTimelineEffects
@@ -7247,11 +7859,10 @@ export default function TikTokLyricsVideoEditor() {
                         seekAudioTo(win.start);
                       }}
                       title={`💧 Blur-Pulse Effect (${win.start.toFixed(2)}s – ${win.end.toFixed(2)}s) — Click to preview frame`}
-                      className={`absolute top-1 bottom-1 z-10 flex items-center justify-center overflow-hidden rounded border px-1 text-[9px] font-bold transition ${
-                        isActiveNow
-                          ? "border-white bg-fuchsia-500 text-white shadow-[0_0_10px_#d946ef]"
-                          : "border-fuchsia-400/70 bg-fuchsia-500/35 text-fuchsia-100 hover:border-white hover:bg-fuchsia-500/55"
-                      }`}
+                      className={`absolute top-1 bottom-1 z-10 flex items-center justify-center overflow-hidden rounded border px-1 text-[9px] font-bold transition ${isActiveNow
+                        ? "border-white bg-fuchsia-500 text-white shadow-[0_0_10px_#d946ef]"
+                        : "border-fuchsia-400/70 bg-fuchsia-500/35 text-fuchsia-100 hover:border-white hover:bg-fuchsia-500/55"
+                        }`}
                       style={{
                         left: `${leftPct}%`,
                         width: `${widthPct}%`,
@@ -7368,8 +7979,8 @@ export default function TikTokLyricsVideoEditor() {
                   {(waveformBars.length > 0
                     ? waveformBars
                     : Array.from({ length: 140 }).map((_, idx) =>
-                        22 + Math.round(Math.abs(Math.sin(idx * 0.45)) * 55)
-                      )
+                      22 + Math.round(Math.abs(Math.sin(idx * 0.45)) * 55)
+                    )
                   ).map((h, barIdx, arr) => {
                     const barPct = barIdx / Math.max(arr.length - 1, 1);
                     const playPct = currentAudioTime / Math.max(totalTimelineDuration, 1);
@@ -7377,9 +7988,8 @@ export default function TikTokLyricsVideoEditor() {
                     return (
                       <div
                         key={barIdx}
-                        className={`flex-1 rounded-full transition-colors ${
-                          played ? "bg-amber-400/80" : "bg-purple-400/35"
-                        }`}
+                        className={`flex-1 rounded-full transition-colors ${played ? "bg-amber-400/80" : "bg-purple-400/35"
+                          }`}
                         style={{ height: `${h}%` }}
                       />
                     );
@@ -7405,11 +8015,10 @@ export default function TikTokLyricsVideoEditor() {
                 return (
                   <div
                     key={idx}
-                    className={`flex items-center gap-2 rounded-xl border p-1.5 transition ${
-                      isActiveNow
-                        ? "border-amber-400 bg-amber-400/15"
-                        : "border-zinc-800 bg-zinc-950"
-                    }`}
+                    className={`flex items-center gap-2 rounded-xl border p-1.5 transition ${isActiveNow
+                      ? "border-amber-400 bg-amber-400/15"
+                      : "border-zinc-800 bg-zinc-950"
+                      }`}
                   >
                     <span className="w-6 text-center font-mono text-[10px] text-zinc-500">
                       #{idx + 1}

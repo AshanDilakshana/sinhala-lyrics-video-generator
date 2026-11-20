@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 from fastapi import UploadFile
 
-from backend.config import FONTS_DIR, TEMP_DIR
+from backend.config import FONTS_DIR, TEMP_DIR, create_resilient_async_client
 
 logger = logging.getLogger(__name__)
 
@@ -983,7 +983,7 @@ async def download_font_from_internet(
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) TikTokLyricsCreator/2.0"
     }
-    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=headers, verify=False) as client:
+    async with create_resilient_async_client(timeout=25.0, headers=headers) as client:
         resp = await client.get(target_url)
         if resp.status_code != 200:
             raise RuntimeError(f"Failed to download font from URL (HTTP {resp.status_code}).")
@@ -1063,7 +1063,7 @@ def render_ffmpeg_font_preview_png(
     clean_text = (sample_text or "මගේ අභියස ලෝකයක් තියා").strip()[:90]
     resolved_ass_fam, resolved_bold = resolve_ass_font_spec(font_family, bold_text)
     cache_key = hashlib.md5(
-        f"v7|{font_family}|{resolved_ass_fam}|{resolved_bold}|{clean_text}|{font_size}|{font_thickness}|{font_brightness}|{primary_color_hex}|{outline_width}|{shadow_depth}|{bold_text}|{italic_text}|{watermark_text}".encode(
+        f"v8|{font_family}|{resolved_ass_fam}|{resolved_bold}|{clean_text}|{font_size}|{font_thickness}|{font_brightness}|{primary_color_hex}|{outline_width}|{shadow_depth}|{bold_text}|{italic_text}|{watermark_text}".encode(
             "utf-8"
         )
     ).hexdigest()[:14]

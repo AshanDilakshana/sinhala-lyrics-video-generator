@@ -506,6 +506,86 @@ async def _build_smooth_looped_video_to_duration(
     return base_visual
 
 
+async def _blend_multiple_clips_with_xfade(
+    normalized_clips: List[Path],
+    job_temp_dir: Path,
+    loop_mode: LoopMode = LoopMode.CROSSFADE,
+) -> Optional[Path]:
+    """
+    Smoothly blend 2+ normalized video clips (`Clip 1 -> Clip 2 -> Clip 3...`) using
+    FFmpeg `xfade=transition=fade` so multi-clip mixes dissolve seamlessly instead of hard-cutting.
+    """
+    if len(normalized_clips) < 2 or len(normalized_clips) > 12:
+        return None
+
+    durations: List[float] = []
+    for p in normalized_clips:
+        d = await get_media_duration(p)
+        if d < 1.1:
+            return None
+        durations.append(d)
+
+    fade_base = 0.45 if loop_mode == LoopMode.NORMAL else 0.65
+    fade_d = round(min(fade_base, min(durations) * 0.25), 2)
+    if fade_d < 0.20:
+        return None
+
+    ffmpeg_bin = get_ffmpeg_binary()
+    input_args: List[str] = []
+    for p in normalized_clips:
+        input_args.extend(["-i", str(p.resolve())])
+
+    fc_parts: List[str] = []
+    cum_dur = durations[0]
+    prev_label = "0:v"
+    for idx in range(1, len(normalized_clips)):
+        offset = round(max(0.2, cum_dur - fade_d), 2)
+        out_label = "vout" if idx == len(normalized_clips) - 1 else f"vx{idx}"
+        suffix = ",fps=30,format=yuv420p" if idx == len(normalized_clips) - 1 else ""
+        fc_parts.append(
+            f"[{prev_label}][{idx}:v]xfade=transition=fade:duration={fade_d}:offset={offset}{suffix}[{out_label}]"
+        )
+        cum_dur = round(offset + durations[idx], 2)
+        prev_label = out_label
+
+    blended_path = job_temp_dir / "stitched_xfade_visuals.mp4"
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        *input_args,
+        "-an",
+        "-filter_complex",
+        ";".join(fc_parts),
+        "-map",
+        "[vout]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "18",
+        *BT709_COLOR_FLAGS,
+        "-loglevel",
+        "error",
+        str(blended_path.resolve()),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    if proc.returncode == 0 and blended_path.exists():
+        logger.info(
+            "Blended %d visual clips with smooth %.2fs xfade transitions -> %.2fs",
+            len(normalized_clips),
+            fade_d,
+            cum_dur,
+        )
+        return blended_path
+    return None
+
+
 async def prepare_concatenated_visual_source(
     visual_clips: List[Path],
     job_temp_dir: Path,
@@ -515,9 +595,12 @@ async def prepare_concatenated_visual_source(
     edit_config: VideoEditConfig,
 ) -> Path:
     """
-    Normalize one or multiple AI-generated animated video clips and, if their combined
-    duration is shorter than the song's `target_duration`, smoothly replay/loop them
-    to match the song's full duration!
+    Normalize one or multiple AI-generated animated video clips:
+    - When multiple clips (2+) are provided, balances their per-clip duration so every clip
+      appears on the song timeline, smoothly crossfade-blends (`xfade`) between each clip,
+      and loops the blended mix to cover `target_duration`.
+    - When a single clip (1) is provided, repeats/loops that single clip smoothly to match
+      the song's `target_duration`.
     """
     normalized_clips: List[Path] = []
     pts_factor = round(1.0 / max(0.5, min(edit_config.clip_speed, 2.0)), 4)
@@ -542,7 +625,15 @@ async def prepare_concatenated_visual_source(
         except Exception:
             parsed_segments = []
 
+    is_multi_clip = len(visual_clips) > 1
+    auto_multi_clip_cap = (
+        round(max(3.5, (target_duration / len(visual_clips)) + 0.65), 2)
+        if is_multi_clip and edit_config.clip_trim_end <= 0
+        else 0.0
+    )
+
     for idx, clip_path in enumerate(visual_clips):
+        clip_dur = await get_media_duration(clip_path)
         base_steps = [
             f"setpts={pts_factor}*PTS",
             (
@@ -557,14 +648,28 @@ async def prepare_concatenated_visual_source(
         base_steps.extend(["fps=30", "format=yuv420p"])
         base_vf = ",".join(base_steps)
 
-        if idx == 0 and parsed_segments:
-            slice_specs = [
-                (seg_idx, s_start, max(0.2, s_end - s_start))
-                for seg_idx, (s_start, s_end) in enumerate(parsed_segments)
-            ]
+        if len(visual_clips) == 1 and idx == 0 and parsed_segments:
+            slice_specs = []
+            for seg_idx, (s_start, s_end) in enumerate(parsed_segments):
+                safe_s = max(0.0, min(s_start, max(0.0, clip_dur - 0.5)))
+                safe_e = min(clip_dur, s_end)
+                if safe_e > safe_s + 0.15:
+                    slice_specs.append((seg_idx, safe_s, round(safe_e - safe_s, 3)))
+            if not slice_specs:
+                slice_specs = [(0, 0.0, 0.0)]
         else:
+            effective_trim_dur = (
+                edit_config.clip_trim_end
+                if edit_config.clip_trim_end > 0
+                else auto_multi_clip_cap
+            )
+            safe_start = (
+                max(0.0, min(edit_config.clip_trim_start, max(0.0, clip_dur - 1.2)))
+                if clip_dur > 1.2
+                else 0.0
+            )
             slice_specs = [
-                (0, edit_config.clip_trim_start, edit_config.clip_trim_end)
+                (0, safe_start, effective_trim_dur)
             ]
 
         for seg_idx, s_start, s_dur in slice_specs:
@@ -611,38 +716,46 @@ async def prepare_concatenated_visual_source(
     if len(normalized_clips) == 1:
         base_visual = normalized_clips[0]
     else:
-        concat_list_path = job_temp_dir / "concat_list.txt"
-        concat_lines = [f"file '{p.name}'" for p in normalized_clips]
-        concat_list_path.write_text("\n".join(concat_lines), encoding="utf-8")
-
-        stitched_path = job_temp_dir / "stitched_visuals.mp4"
-        concat_cmd = [
-            get_ffmpeg_binary(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_list_path.resolve()),
-            "-c",
-            "copy",
-            "-loglevel",
-            "error",
-            str(stitched_path.resolve()),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *concat_cmd,
-            cwd=str(job_temp_dir.resolve()),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        xfade_blended = await _blend_multiple_clips_with_xfade(
+            normalized_clips=normalized_clips,
+            job_temp_dir=job_temp_dir,
+            loop_mode=edit_config.loop_mode,
         )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Failed to stitch AI clips: {stderr.decode('utf-8', errors='replace')}"
+        if xfade_blended is not None:
+            base_visual = xfade_blended
+        else:
+            concat_list_path = job_temp_dir / "concat_list.txt"
+            concat_lines = [f"file '{p.name}'" for p in normalized_clips]
+            concat_list_path.write_text("\n".join(concat_lines), encoding="utf-8")
+
+            stitched_path = job_temp_dir / "stitched_visuals.mp4"
+            concat_cmd = [
+                get_ffmpeg_binary(),
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list_path.resolve()),
+                "-c",
+                "copy",
+                "-loglevel",
+                "error",
+                str(stitched_path.resolve()),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *concat_cmd,
+                cwd=str(job_temp_dir.resolve()),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        base_visual = stitched_path
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to stitch AI clips: {stderr.decode('utf-8', errors='replace')}"
+                )
+            base_visual = stitched_path
 
     # Check if the visual video is shorter than the song's target_duration
     visual_dur = await get_media_duration(base_visual)

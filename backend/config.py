@@ -115,3 +115,58 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
 DEFAULT_ALIGNMENT_LANG = os.getenv("DEFAULT_ALIGNMENT_LANG", "si")
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+
+
+def create_resilient_async_client(
+    timeout: float = 15.0,
+    headers=None,
+    verify: bool = False,
+    follow_redirects: bool = True,
+):
+    """
+    Create an `httpx.AsyncClient` bound to IPv4 (`0.0.0.0`) so networks with broken or
+    blackholed IPv6 routing never hang 20-30s on DNS AAAA addresses, with automatic fallback.
+    """
+    import httpx
+
+    try:
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", verify=verify)
+        return httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            transport=transport,
+            headers=headers,
+        )
+    except Exception:
+        return httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            verify=verify,
+            headers=headers,
+        )
+
+
+def create_resilient_sync_client(
+    timeout: float = 10.0,
+    headers=None,
+    verify: bool = False,
+    follow_redirects: bool = True,
+):
+    """Synchronous IPv4-first `httpx.Client` for STT & threadpool workers."""
+    import httpx
+
+    try:
+        transport = httpx.HTTPTransport(local_address="0.0.0.0", verify=verify)
+        return httpx.Client(
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            transport=transport,
+            headers=headers,
+        )
+    except Exception:
+        return httpx.Client(
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            verify=verify,
+            headers=headers,
+        )

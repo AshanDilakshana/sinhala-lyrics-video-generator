@@ -24,14 +24,14 @@ A full-stack **9:16 TikTok / Reels Sinhala AI Lyrics Video Editor** built with *
 - **Clean Text Normalization**: Strips site headers/footers, repairs broken Sinhala Rakaraansha ZWJ sequences, and splits compound two-phrase lines.
 
 ### 3. Word-Level Sinhala Lyrics Sync & Local AI Alignment
-- **Stereo Center-Vocal Isolation** (`backend/services/alignment_service.py`): Uses FFmpeg `stereotools` center-channel isolation + vocal bandpass (`180Hz–4200Hz`) + `afftdn` + `dynaudnorm` to separate lead vocals from stereo instruments.
-- **Local AI Phoneme Forced Aligner (Optional, Free, Offline)**: Integrates `ctc-forced-aligner` with Meta MMS (`MahmoudAshraf/mms-300m-1130-forced-aligner`, `sin` romanized) for millisecond-accurate word-level `WordTiming` sync.
-- **ASR Anchor + Breath-Dip DP Fallback**: Uses Google Speech-to-Text (`si-LK` / `en-US`) anchors and STFT vocal-envelope breath-dip dynamic programming with syllable/mora (මාත්‍රා) weighting when offline or when `ctc-forced-aligner` is not installed.
+- **Neural Vocal Separation (`Demucs htdemucs`)** (`backend/services/alignment_service.py`): Isolates clean lead vocals from drums, bass, and stereo instruments (`vocal_isolated_demucs.wav`) with automatic FFmpeg stereo center-vocal fallback.
+- **Local AI Phoneme Forced Aligner (`torchaudio.pipelines.MMS_FA`, Free, Offline)**: Uses Meta MMS (`mms_fa_model.pt`) with Sinhala phonemic Romanization (`_sinhala_word_to_mms_roman`) and `*` interlude masking for millisecond-accurate word-level `WordTiming` sync.
+- **ASR Anchor + Breath-Dip DP Fallback**: Uses IPv4-resilient Google Speech-to-Text (`si-LK` / `en-US`) anchors, ASR-phrase Sri Lankan lyrics discovery, and STFT vocal-envelope breath-dip dynamic programming with syllable/mora (මාත්‍රා) weighting.
 
 ### 4. Live NLE Video Studio & Customization (`frontend/src/app/page.tsx`)
 - **Live 9:16 Canvas Preview**: Real-time preview of rounded square card / full-screen frames, color grades, zoom, mirror flip, vignette, blur transitions, and animated Sinhala captions with waveform scrubbing.
 - **Interactive Lyrics Timeline Editor**: Edit line text, adjust individual start/end timestamps, shift global lyrics offset (`lyrics_offset_sec`), or paste manual `.lrc` / plain lyrics and re-sync.
-- **Multi-Clip Visual Editing**: Upload multiple AI/animated video clips, trim start/end, configure split clip segments, set playback speed, and choose loop modes (`crossfade`, `boomerang`, `loop`).
+- **Multi-Clip Visual Editing**: Upload multiple AI/animated video clips, trim start/end, configure split clip segments, set playback speed, and choose loop modes (`crossfade`, `pingpong`, `normal`).
 - **Custom Sinhala Font Manager** (`backend/services/font_service.py`): Supports Unicode & FM/legacy Sinhala fonts (with automatic Unicode-to-FM glyph mapping), custom `.ttf`/`.otf` upload, URL font download, system font extraction, and real FFmpeg/libass preview PNGs.
 
 ### 5. Draft & Final Render Export (`backend/main.py`, `backend/services/video_service.py`)
@@ -76,7 +76,7 @@ A full-stack **9:16 TikTok / Reels Sinhala AI Lyrics Video Editor** built with *
 ## Setup & Running
 
 ### Prerequisites
-- **Python 3.10+** (3.11–3.13 recommended if installing `ctc-forced-aligner`)
+- **Python 3.10+** (tested cleanly on Python 3.14 & Apple M1 / Windows)
 - **Node.js 18+** & `npm`
 - **FFmpeg** (auto-resolved via `static-ffmpeg` / `imageio-ffmpeg` or system `ffmpeg`)
 
@@ -94,9 +94,9 @@ A full-stack **9:16 TikTok / Reels Sinhala AI Lyrics Video Editor** built with *
    npm install
    npm run dev
    ```
-3. *(Optional)* Enable Local AI word-level Sinhala phoneme sync:
+3. *(Included in `requirements.txt`)* Local AI neural vocal isolation (`demucs`) & word-level Sinhala phoneme sync (`torchaudio.pipelines.MMS_FA`):
    ```bash
-   ./venv/bin/pip install torch torchaudio ctc-forced-aligner
+   ./venv/bin/pip install torch torchaudio demucs unidecode huggingface-hub
    ```
 
 ### Windows

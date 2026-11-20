@@ -1,14 +1,18 @@
+import asyncio
 import logging
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 import httpx
 
-from backend.config import SP_DC_COOKIE, SPOTIFY_LYRICS_API_URL
+from backend.config import SP_DC_COOKIE, SPOTIFY_LYRICS_API_URL, create_resilient_async_client
 from backend.models import LyricLine, LyricsResult, LyricsSourceTier
 from backend.services.alignment_service import (
+    _clean_lyrics_lines,
+    _extract_asr_windows_sync,
     align_lyrics_with_audio,
     select_and_align_best_lyrics_candidate,
+    verify_and_enrich_lrc_lines,
 )
 from backend.services.media_service import (
     identify_song_with_shazam,
@@ -205,7 +209,7 @@ async def fetch_lrclib_lyrics(
     }
     plain_lyrics_fallback: Optional[str] = None
 
-    async with httpx.AsyncClient(timeout=15.0, headers=headers, verify=False) as client:
+    async with create_resilient_async_client(timeout=15.0, headers=headers) as client:
         # 1. Try exact /api/get if both track_name and artist_name are provided
         if artist_name.strip():
             try:
@@ -296,7 +300,7 @@ async def fetch_spotify_lyrics(
         "App-Platform": "WebPlayer",
     }
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=False) as client:
+    async with create_resilient_async_client(timeout=15.0) as client:
         try:
             # Step 1: Exchange sp_dc cookie for a temporary WebPlayer Bearer accessToken
             token_resp = await client.get(
@@ -459,6 +463,7 @@ async def _fetch_and_verify_sequential_sites(
     shazam_clip_offset_sec: float = 0.0,
     shazam_time_skew: float = 0.0,
     shazam_lyrics_text: str = "",
+    hint_texts: Optional[List[str]] = None,
 ) -> Tuple[Optional[LyricsResult], List[Tuple[str, str]]]:
     """
     Walk through lyrics sources ONE BY ONE in priority order until valid lyrics are
@@ -502,13 +507,18 @@ async def _fetch_and_verify_sequential_sites(
             total_duration=total_duration,
             language=language,
             fallback_to_auto=False,
+            clip_offset_sec=shazam_clip_offset_sec,
+            hint_texts=hint_texts,
         )
         if matched_src and aligned:
             logger.info("Sequential lyrics fetch succeeded at site '%s' (%d aligned lines)", matched_src, len(aligned))
+            matched_raw = next((body for s, body in fresh if s == matched_src), fresh[0][1])
+            clean_full = "\n".join(_clean_lyrics_lines(matched_raw))
             return LyricsResult(
                 tier=LyricsSourceTier.TIER_3_ALIGNMENT,
                 lines=aligned,
                 raw_lrc=lines_to_lrc(aligned),
+                full_lyrics_text=clean_full or "\n".join(line.text for line in aligned),
                 lyrics_source=matched_src,
             )
         logger.info("Site [%s] did not match sung vocals; moving to next site...", site_label)
@@ -540,6 +550,33 @@ async def _fetch_and_verify_sequential_sites(
         if verified:
             return verified, unverified_pool
 
+    async def _accept_lrc_if_verified(
+        cand_res: Optional[LyricsResult],
+        title_fallback: str,
+        artist_fallback: str,
+        src_label: str,
+        full_plain: str,
+    ) -> Optional[LyricsResult]:
+        if not cand_res or not cand_res.lines:
+            return None
+        v_lines, v_status = await verify_and_enrich_lrc_lines(
+            audio_path=audio_path,
+            lrc_lines=cand_res.lines,
+            job_temp_dir=job_temp_dir,
+            total_duration=total_duration,
+            language=language,
+        )
+        if not v_lines:
+            logger.info("Skipped mismatched %s LRC slice; checking full-text alignment.", src_label)
+            return None
+        cand_res.lines = v_lines
+        cand_res.raw_lrc = lines_to_lrc(v_lines)
+        cand_res.detected_title = title_fallback
+        cand_res.detected_artist = artist_fallback or None
+        cand_res.lyrics_source = f"{src_label} + Auto-Mix" if v_status == "hybrid" else src_label
+        cand_res.full_lyrics_text = full_plain
+        return cand_res
+
     # --- Site 5: LRCLIB ---
     lrclib_items: List[Tuple[str, str]] = []
     for track_q, artist_q in search_pairs[:3]:
@@ -549,11 +586,17 @@ async def _fetch_and_verify_sequential_sites(
             total_duration=total_duration,
         )
         if lrclib_res:
+            full_lrc_plain = (
+                "\n".join(_clean_lyrics_lines(plain_lrc))
+                if plain_lrc
+                else "\n".join(line.text for line in lrclib_res.lines)
+            )
             if _lrc_fits_clip(lrclib_res, total_duration, language):
-                lrclib_res.detected_title = track_q
-                lrclib_res.detected_artist = artist_q or None
-                lrclib_res.lyrics_source = "LRCLIB Synced"
-                return lrclib_res, unverified_pool
+                accepted = await _accept_lrc_if_verified(
+                    lrclib_res, track_q, artist_q, "LRCLIB Synced", full_lrc_plain
+                )
+                if accepted:
+                    return accepted, unverified_pool
             sliced_lrc = _slice_lrc_with_shazam_offset(
                 lrclib_res,
                 clip_offset_sec=shazam_clip_offset_sec,
@@ -561,11 +604,12 @@ async def _fetch_and_verify_sequential_sites(
                 total_duration=total_duration,
             )
             if sliced_lrc:
-                sliced_lrc.detected_title = track_q
-                sliced_lrc.detected_artist = artist_q or None
-                sliced_lrc.lyrics_source = "LRCLIB Synced (Shazam Offset)"
-                return sliced_lrc, unverified_pool
-            lrclib_items.append(("LRCLIB Synced Text", "\n".join(line.text for line in lrclib_res.lines)))
+                accepted = await _accept_lrc_if_verified(
+                    sliced_lrc, track_q, artist_q, "LRCLIB Synced (Shazam Offset)", full_lrc_plain
+                )
+                if accepted:
+                    return accepted, unverified_pool
+            lrclib_items.append(("LRCLIB Synced Text", full_lrc_plain))
         if plain_lrc:
             lrclib_items.append(("LRCLIB Plain", plain_lrc))
     verified = await _try_verify_site("LRCLIB", lrclib_items)
@@ -581,11 +625,13 @@ async def _fetch_and_verify_sequential_sites(
             total_duration=total_duration,
         )
         if spotify_res:
+            full_sp_plain = "\n".join(line.text for line in spotify_res.lines)
             if _lrc_fits_clip(spotify_res, total_duration, language):
-                spotify_res.detected_title = track_q
-                spotify_res.detected_artist = artist_q or None
-                spotify_res.lyrics_source = "Spotify Synced"
-                return spotify_res, unverified_pool
+                accepted = await _accept_lrc_if_verified(
+                    spotify_res, track_q, artist_q, "Spotify Synced", full_sp_plain
+                )
+                if accepted:
+                    return accepted, unverified_pool
             sliced_sp = _slice_lrc_with_shazam_offset(
                 spotify_res,
                 clip_offset_sec=shazam_clip_offset_sec,
@@ -593,11 +639,12 @@ async def _fetch_and_verify_sequential_sites(
                 total_duration=total_duration,
             )
             if sliced_sp:
-                sliced_sp.detected_title = track_q
-                sliced_sp.detected_artist = artist_q or None
-                sliced_sp.lyrics_source = "Spotify Synced (Shazam Offset)"
-                return sliced_sp, unverified_pool
-            spotify_items.append(("Spotify Synced Text", "\n".join(line.text for line in spotify_res.lines)))
+                accepted = await _accept_lrc_if_verified(
+                    sliced_sp, track_q, artist_q, "Spotify Synced (Shazam Offset)", full_sp_plain
+                )
+                if accepted:
+                    return accepted, unverified_pool
+            spotify_items.append(("Spotify Synced Text", full_sp_plain))
     verified = await _try_verify_site("Spotify", spotify_items)
     if verified:
         return verified, unverified_pool
@@ -615,10 +662,13 @@ async def resolve_synced_lyrics(
     language: str = "si",
     raw_audio_path: Optional[Path] = None,
     alt_title: str = "",
+    start_line_index: int = -1,
+    force_refresh_asr: bool = False,
 ) -> LyricsResult:
     """
     Master 3-Tier Lyrics & Timing Engine:
-    1. If manual lyrics are provided, sync them directly against vocals.
+    1. If manual lyrics are provided, sync them directly against vocals (using Shazam
+       clip offset / user-selected `start_line_index` to support mid-song clips).
     2. Otherwise fingerprint the audio with Shazam (`shazamio`) FIRST to detect the
        true Song Title, Artist, exact Clip Start Offset inside the original song,
        and any embedded Shazam lyrics (combining with link metadata candidates).
@@ -630,47 +680,23 @@ async def resolve_synced_lyrics(
     caught_title = _clean_song_title_for_search(song_name) or _clean_song_title_for_search(alt_title)
     caught_artist = _clean_song_title_for_search(artist_name)
 
-    if clean_manual:
-        existing_lrc_lines = parse_lrc_to_lines(clean_manual, total_duration)
-        if existing_lrc_lines:
-            logger.info("Manual input already contains valid .lrc timestamps (%d lines)", len(existing_lrc_lines))
-            return LyricsResult(
-                tier=LyricsSourceTier.TIER_1_LRCLIB,
-                lines=existing_lrc_lines,
-                raw_lrc=clean_manual,
-                detected_title=caught_title or None,
-                detected_artist=caught_artist or None,
-                lyrics_source="Manual LRC",
-            )
-
-        logger.info("Manual lyrics provided (%d chars); running Tier 3 Forced Alignment...", len(clean_manual))
-        aligned_lines = await align_lyrics_with_audio(
-            audio_path=audio_path,
-            lyrics_text=clean_manual,
-            job_temp_dir=job_temp_dir,
-            total_duration=total_duration,
-            language=language,
-        )
-        return LyricsResult(
-            tier=LyricsSourceTier.TIER_3_ALIGNMENT,
-            lines=aligned_lines,
-            raw_lrc=lines_to_lrc(aligned_lines),
-            detected_title=caught_title or None,
-            detected_artist=caught_artist or None,
-            lyrics_source="Manual Lyrics + Vocal Sync",
-        )
-
-    fingerprint_source = raw_audio_path if (raw_audio_path and raw_audio_path.exists()) else audio_path
+    # Fingerprint the active trimmed audio clip (`extracted_audio.m4a` or `audio_path`) FIRST
+    # so `shazam_clip_offset_sec` reflects where the active clip begins inside the full song!
+    trimmed_m4a = job_temp_dir / "extracted_audio.m4a"
+    fingerprint_source = (
+        trimmed_m4a
+        if trimmed_m4a.exists()
+        else (audio_path if audio_path.exists() else raw_audio_path)
+    )
     shazam_clip_offset_sec = 0.0
     shazam_time_skew = 0.0
     shazam_lyrics_text = ""
 
-    # Step 1: Always run Shazam audio fingerprinting FIRST so noisy TikTok captions
-    # (e.g. "Horahin balanne", "malehi avasara... #fyp", "original sound") get replaced
-    # by the real Song Title & Artist + exact full-song timestamp offset!
     search_pairs: List[Tuple[str, str]] = []
-    if fingerprint_source.exists():
+    if fingerprint_source and fingerprint_source.exists():
         shazam_info = await identify_song_with_shazam_detailed(fingerprint_source)
+        if not shazam_info and raw_audio_path and raw_audio_path.exists() and raw_audio_path != fingerprint_source:
+            shazam_info = await identify_song_with_shazam_detailed(raw_audio_path)
         if shazam_info and shazam_info.get("title"):
             shazam_title = shazam_info["title"]
             shazam_artist = shazam_info.get("artist") or ""
@@ -680,6 +706,60 @@ async def resolve_synced_lyrics(
             caught_title = shazam_title
             caught_artist = shazam_artist or caught_artist
             search_pairs.extend(extract_song_search_candidates(shazam_title, shazam_artist))
+
+    hint_texts = [
+        t
+        for t in (
+            _clean_song_title_for_search(song_name),
+            _clean_song_title_for_search(alt_title),
+        )
+        if t
+    ]
+
+    if clean_manual:
+        existing_lrc_lines = parse_lrc_to_lines(clean_manual, total_duration)
+        if existing_lrc_lines and start_line_index < 0:
+            logger.info("Manual input already contains valid .lrc timestamps (%d lines)", len(existing_lrc_lines))
+            return LyricsResult(
+                tier=LyricsSourceTier.TIER_1_LRCLIB,
+                lines=existing_lrc_lines,
+                raw_lrc=clean_manual,
+                full_lyrics_text="\n".join(line.text for line in existing_lrc_lines),
+                detected_title=caught_title or None,
+                detected_artist=caught_artist or None,
+                lyrics_source="Manual LRC",
+            )
+
+        clean_full_manual = "\n".join(_clean_lyrics_lines(clean_manual))
+        logger.info(
+            "Manual/Fetched lyrics provided (%d chars, start_line_index=%d); running Vocal Forced Alignment...",
+            len(clean_manual),
+            start_line_index,
+        )
+        aligned_lines = await align_lyrics_with_audio(
+            audio_path=audio_path,
+            lyrics_text=clean_manual,
+            job_temp_dir=job_temp_dir,
+            total_duration=total_duration,
+            language=language,
+            clip_offset_sec=shazam_clip_offset_sec,
+            hint_texts=hint_texts,
+            start_line_index=start_line_index,
+            force_refresh_asr=force_refresh_asr,
+        )
+        return LyricsResult(
+            tier=LyricsSourceTier.TIER_3_ALIGNMENT,
+            lines=aligned_lines,
+            raw_lrc=lines_to_lrc(aligned_lines),
+            full_lyrics_text=clean_full_manual or "\n".join(line.text for line in aligned_lines),
+            detected_title=caught_title or None,
+            detected_artist=caught_artist or None,
+            lyrics_source=(
+                f"Vocal Sync (From Line #{start_line_index + 1})"
+                if start_line_index >= 0
+                else "Vocal Sync (Auto-Detected Position)"
+            ),
+        )
 
     # Merge any link metadata / user-provided search pairs after Shazam's exact match
     meta_pairs = extract_song_search_candidates(song_name, artist_name, alt_title)
@@ -701,6 +781,7 @@ async def resolve_synced_lyrics(
             shazam_clip_offset_sec=shazam_clip_offset_sec,
             shazam_time_skew=shazam_time_skew,
             shazam_lyrics_text=shazam_lyrics_text,
+            hint_texts=hint_texts,
         )
         unverified_pool.extend(pool)
         if res:
@@ -710,6 +791,79 @@ async def resolve_synced_lyrics(
 
     # If Google ASR was offline (`not asr_windows`) yet a web site DID return lyrics, align acoustically;
     # otherwise fall back cleanly to Mode A Auto-Captions.
+    # Also ensure that if we detected a song title (via Shazam or metadata) and `unverified_pool` is still empty,
+    # we fetch the full song lyrics from Sri Lankan sites / LRCLIB / Shazam so `full_lyrics_text` always has
+    # the entire song lyrics available in the "Full Text" tab for user line selection!
+    if not unverified_pool and search_pairs and _is_sinhala_lang(language):
+        for track_q, artist_q in search_pairs[:3]:
+            for site in SRI_LANKAN_SITE_ORDER:
+                try:
+                    fetched_list = await fetch_lyrics_from_single_site(
+                        site=site,
+                        query=track_q,
+                        artist_name=artist_q,
+                        max_pages=1,
+                    )
+                    for item in fetched_list:
+                        if item.get("lyrics_text"):
+                            unverified_pool.append((item.get("source") or site, item["lyrics_text"]))
+                    if unverified_pool:
+                        break
+                except Exception:
+                    continue
+            if unverified_pool:
+                break
+
+    # Fallback: If Shazam/metadata found no web lyrics yet (`not unverified_pool`),
+    # use Sinhala ASR phrases heard in the clip to search Sri Lankan lyrics hubs
+    # (`geemansala.com` full-text WP search + `lyrihub.lk` / `lyrics-lk.com`).
+    if not unverified_pool and _is_sinhala_lang(language) and audio_path.exists():
+        try:
+            asr_windows = await asyncio.to_thread(
+                _extract_asr_windows_sync,
+                audio_path,
+                job_temp_dir,
+                total_duration,
+                language,
+            )
+            phrase_candidates: List[str] = []
+            seen_phrases = set()
+            for _, _, wt in sorted(asr_windows, key=lambda w: len(w[2]), reverse=True):
+                words = [w for w in wt.strip().split() if w]
+                if len(words) < 2:
+                    continue
+                phrase = " ".join(words[:5])
+                si_chars = sum(1 for c in phrase if 0x0D80 <= ord(c) <= 0x0DFF)
+                if si_chars >= 7 and phrase not in seen_phrases:
+                    seen_phrases.add(phrase)
+                    phrase_candidates.append(phrase)
+                if len(phrase_candidates) >= 3:
+                    break
+
+            for phrase in phrase_candidates:
+                for site in ("geemansala.com", "lyrihub.lk", "lyrics-lk.com"):
+                    try:
+                        hits = await fetch_lyrics_from_single_site(
+                            site=site,
+                            query=phrase,
+                            artist_name="",
+                            max_pages=2,
+                        )
+                        for item in hits:
+                            if item.get("lyrics_text"):
+                                src_tag = f"{item.get('source') or site} (Audio Match)"
+                                unverified_pool.append((src_tag, item["lyrics_text"]))
+                                if not caught_title and item.get("title"):
+                                    caught_title = item["title"]
+                                if not caught_artist and item.get("artist"):
+                                    caught_artist = item["artist"]
+                    except Exception:
+                        continue
+                if len(unverified_pool) >= 3:
+                    break
+        except Exception as exc:
+            logger.debug("ASR-phrase Sri Lankan lyrics lookup skipped: %s", exc)
+
     matched_source, aligned_lines = await select_and_align_best_lyrics_candidate(
         audio_path=audio_path,
         candidates=unverified_pool,
@@ -717,13 +871,24 @@ async def resolve_synced_lyrics(
         total_duration=total_duration,
         language=language,
         fallback_to_auto=True,
+        clip_offset_sec=shazam_clip_offset_sec,
+        hint_texts=hint_texts,
     )
     source_label = matched_source if matched_source != "auto_asr" else f"Auto-Captions ({language})"
+    if matched_source == "auto_asr":
+        clean_full_pool = ""
+    else:
+        matched_full_raw = next(
+            (txt for s, txt in unverified_pool if s == matched_source and txt.strip()),
+            unverified_pool[0][1] if unverified_pool else shazam_lyrics_text,
+        )
+        clean_full_pool = "\n".join(_clean_lyrics_lines(matched_full_raw)) if matched_full_raw else ""
 
     return LyricsResult(
         tier=LyricsSourceTier.TIER_3_ALIGNMENT,
         lines=aligned_lines,
         raw_lrc=lines_to_lrc(aligned_lines),
+        full_lyrics_text=clean_full_pool or "\n".join(line.text for line in aligned_lines),
         detected_title=caught_title or None,
         detected_artist=caught_artist or None,
         lyrics_source=source_label,
