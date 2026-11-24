@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from backend.models import FrameLayout, LyricLine, StylePreset, VideoEditConfig
+from backend.models import FrameLayout, LyricLine, LyricTransition, StylePreset, VideoEditConfig
 from backend.services.font_service import (
     get_ass_font_size_multiplier,
     get_font_conversion_context,
@@ -84,14 +84,16 @@ def _build_progressive_word_fade_line(
     pos_tag: str = "",
     text_transform: Optional[Callable[[str], str]] = None,
     target_alpha_hex: str = "00",
+    speed: float = 1.0,
 ) -> str:
     """
     Replicates the The_Black Hart word-by-word progressive opacity reveal:
     Uses per-word acoustic syllable onset timings (`line.words`) when available,
     so each Sinhala word fades in at the exact millisecond the singer articulates it!
     """
+    spd = max(0.4, min(float(speed), 2.5))
     duration_ms = max(int(round((line.end - line.start) * 1000)), 400)
-    fade_out_ms = min(240, duration_ms // 4)
+    fade_out_ms = max(40, min(int(round(240 / spd)), duration_ms // 4))
     transform = text_transform or (lambda s: s)
     alpha_tag = f"&H{target_alpha_hex}&"
 
@@ -101,8 +103,10 @@ def _build_progressive_word_fade_line(
         max_reveal_end = max(140, duration_ms - fade_out_ms)
         for idx, wt in enumerate(line.words):
             safe_word = _escape_ass_text(transform(wt.word))
-            t_start = max(0, min(wt.start_ms, max(0, max_reveal_end - 110)))
-            t_end = max(t_start + 100, min(wt.end_ms, max_reveal_end))
+            raw_word_dur = max(wt.end_ms - wt.start_ms, 100)
+            scaled_word_dur = max(45, int(round(raw_word_dur / spd)))
+            t_start = max(0, min(wt.start_ms, max(0, max_reveal_end - 80)))
+            t_end = max(t_start + 45, min(t_start + scaled_word_dur, max_reveal_end))
             if idx == 0:
                 parts.append(
                     rf"{{{pos_tag}\fad(0,{fade_out_ms})\alpha&HFF&\t({t_start},{t_end},\alpha{alpha_tag})}}{safe_word}"
@@ -116,11 +120,15 @@ def _build_progressive_word_fade_line(
     words = [w for w in line.text.strip().split(" ") if w]
     if len(words) <= 1:
         safe = _escape_ass_text(transform(line.text.strip()))
-        return rf"{{{pos_tag}\fad(180,{fade_out_ms})}}{safe}"
+        single_fade_in = max(40, int(round(180 / spd)))
+        return rf"{{{pos_tag}\fad({single_fade_in},{fade_out_ms})}}{safe}"
 
-    reveal_span_ms = max(int(duration_ms * 0.68), len(words) * 150)
-    step_ms = reveal_span_ms // len(words)
-    word_fade_dur = max(min(step_ms + 110, 320), 140)
+    reveal_span_ms = min(
+        max(300, duration_ms - fade_out_ms),
+        max(int((duration_ms * 0.68) / spd), len(words) * max(70, int(round(150 / spd)))),
+    )
+    step_ms = max(40, reveal_span_ms // len(words))
+    word_fade_dur = max(50, min(int(round(220 / spd)), step_ms + int(round(110 / spd))))
 
     parts = []
     for idx, word in enumerate(words):
@@ -286,8 +294,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f"Dialogue: 0,0:00:00.00,{end_wm},Watermark,,0,0,0,,{{\\an5\\pos({wm_x},{wm_y})\\fad(400,600)}}{safe_wm}"
         )
 
-    pop_animation = rf"{{{pos_tag}\fad(90,90)\t(0,110,\fscx108\fscy108)\t(110,220,\fscx100\fscy100)}}"
-    soft_fade_animation = rf"{{{pos_tag}\fad(220,240)}}"
+    anim_speed = max(0.4, min(float(getattr(cfg, "lyric_animation_speed", 1.0)), 2.5))
+    req_transition = getattr(cfg, "lyric_transition", LyricTransition.AUTO)
+    if req_transition == LyricTransition.AUTO:
+        if preset == StylePreset.RW_AESTHETIC_SINHALA:
+            effective_transition = LyricTransition.WORD_FADE
+        elif preset == StylePreset.SOFT_LINE_FADE:
+            effective_transition = LyricTransition.SOFT_FADE
+        else:
+            effective_transition = LyricTransition.POP_SCALE
+    else:
+        effective_transition = req_transition
+
+    pop_fade_ms = max(35, int(round(90 / anim_speed)))
+    pop_t1 = max(40, int(round(110 / anim_speed)))
+    pop_t2 = max(pop_t1 + 40, int(round(220 / anim_speed)))
+    soft_fade_in_ms = max(45, int(round(220 / anim_speed)))
+    soft_fade_out_ms = max(45, int(round(240 / anim_speed)))
+    slide_ms = max(60, int(round(260 / anim_speed)))
+    slide_fade_in_ms = max(45, int(round(190 / anim_speed)))
+    slide_fade_out_ms = max(45, int(round(210 / anim_speed)))
+    move_tag = rf"\move({pos_x},{pos_y + 28},{pos_x},{pos_y},0,{slide_ms})"
+
+    pop_animation = rf"{{{pos_tag}\fad({pop_fade_ms},{pop_fade_ms})\t(0,{pop_t1},\fscx108\fscy108)\t({pop_t1},{pop_t2},\fscx100\fscy100)}}"
+    soft_fade_animation = rf"{{{pos_tag}\fad({soft_fade_in_ms},{soft_fade_out_ms})}}"
+    slide_up_animation = rf"{{{move_tag}\fad({slide_fade_in_ms},{slide_fade_out_ms})}}"
+    instant_animation = rf"{{{pos_tag}\fad(25,25)}}"
 
     for idx, line in enumerate(lines):
         shifted_start = max(0.0, line.start + offset_sec)
@@ -295,9 +327,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         start_ass = _format_ass_timestamp(shifted_start)
         end_ass = _format_ass_timestamp(shifted_end)
 
-        if preset == StylePreset.RW_AESTHETIC_SINHALA:
+        if effective_transition == LyricTransition.WORD_FADE:
             styled_text = _build_progressive_word_fade_line(
-                line, pos_tag=pos_tag, text_transform=_transform_lyric_text
+                line, pos_tag=pos_tag, text_transform=_transform_lyric_text, speed=anim_speed
             )
             glow_text = (
                 _build_progressive_word_fade_line(
@@ -305,21 +337,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     pos_tag=rf"{pos_tag}\blur{glow_blur}",
                     text_transform=_transform_lyric_text,
                     target_alpha_hex=glow_alpha_hex,
+                    speed=anim_speed,
                 )
                 if use_glow_layer
                 else ""
             )
-            style_name = "TikTokCenter"
-        elif preset == StylePreset.SOFT_LINE_FADE:
+            style_name = "TikTokCenter" if preset in (StylePreset.RW_AESTHETIC_SINHALA, StylePreset.SOFT_LINE_FADE) or idx % 2 == 0 else "TikTokAlt"
+        elif effective_transition == LyricTransition.SOFT_FADE:
             escaped_line = _escape_ass_text(_transform_lyric_text(line.text))
             styled_text = f"{soft_fade_animation}{escaped_line}"
-            glow_text = rf"{{{pos_tag}\blur{glow_blur}\fad(220,240)}}{escaped_line}" if use_glow_layer else ""
-            style_name = "TikTokCenter"
+            glow_text = rf"{{{pos_tag}\blur{glow_blur}\fad({soft_fade_in_ms},{soft_fade_out_ms})}}{escaped_line}" if use_glow_layer else ""
+            style_name = "TikTokCenter" if preset in (StylePreset.RW_AESTHETIC_SINHALA, StylePreset.SOFT_LINE_FADE) or idx % 2 == 0 else "TikTokAlt"
+        elif effective_transition == LyricTransition.SLIDE_UP:
+            escaped_line = _escape_ass_text(_transform_lyric_text(line.text))
+            styled_text = f"{slide_up_animation}{escaped_line}"
+            glow_text = rf"{{{move_tag}\blur{glow_blur}\fad({slide_fade_in_ms},{slide_fade_out_ms})}}{escaped_line}" if use_glow_layer else ""
+            style_name = "TikTokCenter" if preset in (StylePreset.RW_AESTHETIC_SINHALA, StylePreset.SOFT_LINE_FADE) or idx % 2 == 0 else "TikTokAlt"
+        elif effective_transition == LyricTransition.INSTANT:
+            escaped_line = _escape_ass_text(_transform_lyric_text(line.text))
+            styled_text = f"{instant_animation}{escaped_line}"
+            glow_text = rf"{{{pos_tag}\blur{glow_blur}\fad(25,25)}}{escaped_line}" if use_glow_layer else ""
+            style_name = "TikTokCenter" if preset in (StylePreset.RW_AESTHETIC_SINHALA, StylePreset.SOFT_LINE_FADE) or idx % 2 == 0 else "TikTokAlt"
         else:
             escaped_line = _escape_ass_text(_transform_lyric_text(line.text))
             styled_text = f"{pop_animation}{escaped_line}"
             glow_text = (
-                rf"{{{pos_tag}\blur{glow_blur}\fad(90,90)\t(0,110,\fscx108\fscy108)\t(110,220,\fscx100\fscy100)}}{escaped_line}"
+                rf"{{{pos_tag}\blur{glow_blur}\fad({pop_fade_ms},{pop_fade_ms})\t(0,{pop_t1},\fscx108\fscy108)\t({pop_t1},{pop_t2},\fscx100\fscy100)}}{escaped_line}"
                 if use_glow_layer
                 else ""
             )

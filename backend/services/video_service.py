@@ -604,11 +604,15 @@ async def prepare_concatenated_visual_source(
     """
     normalized_clips: List[Path] = []
     pts_factor = round(1.0 / max(0.5, min(edit_config.clip_speed, 2.0)), 4)
-    zoom = max(1.0, min(edit_config.video_zoom, 1.6))
+    zoom = max(1.0, min(edit_config.video_zoom, 2.5))
     scaled_w = int(round(card_w * zoom))
     scaled_h = int(round(card_h * zoom))
     scaled_w += scaled_w % 2
     scaled_h += scaled_h % 2
+    raw_px = getattr(edit_config, "video_pos_x_percent", 50.0)
+    raw_py = getattr(edit_config, "video_pos_y_percent", 50.0)
+    pos_x = max(0.0, min(100.0, 50.0 if raw_px is None else float(raw_px))) / 100.0
+    pos_y = max(0.0, min(100.0, 50.0 if raw_py is None else float(raw_py))) / 100.0
 
     parsed_segments: List[Tuple[float, float]] = []
     if getattr(edit_config, "clip_segments_json", ""):
@@ -641,7 +645,7 @@ async def prepare_concatenated_visual_source(
                 "flags=lanczos+accurate_rnd+full_chroma_int:"
                 "in_color_matrix=auto:in_range=auto:out_color_matrix=bt709:out_range=tv"
             ),
-            f"crop={card_w}:{card_h}",
+            f"crop={card_w}:{card_h}:(iw-{card_w})*{pos_x:.4f}:(ih-{card_h})*{pos_y:.4f}",
         ]
         if edit_config.mirror_flip:
             base_steps.append("hflip")

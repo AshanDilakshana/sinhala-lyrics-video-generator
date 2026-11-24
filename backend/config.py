@@ -103,6 +103,12 @@ try:
 except Exception as exc:
     logger.warning("Could not pre-create Downloads export folder '%s': %s", DOWNLOADS_EXPORT_DIR, exc)
 
+# Auto-expiration / cleanup TTLs for temporary & internal output files
+TEMP_JOB_TTL_HOURS = float(os.getenv("TEMP_JOB_TTL_HOURS", "2"))
+TEMP_CACHE_TTL_HOURS = float(os.getenv("TEMP_CACHE_TTL_HOURS", "6"))
+OUTPUT_TTL_HOURS = float(os.getenv("OUTPUT_TTL_HOURS", "24"))
+CLEANUP_INTERVAL_MINUTES = float(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
+
 # Spotify Tier 2 Settings
 SP_DC_COOKIE = os.getenv("SP_DC_COOKIE", "")
 SPOTIFY_LYRICS_API_URL = os.getenv(
@@ -113,6 +119,10 @@ SPOTIFY_LYRICS_API_URL = os.getenv(
 ALIGNMENT_ENGINE = os.getenv("ALIGNMENT_ENGINE", "auto")  # auto | aeneas | whisper
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
 DEFAULT_ALIGNMENT_LANG = os.getenv("DEFAULT_ALIGNMENT_LANG", "si")
+
+# Optional Google Gemini AI Audio Identification & Lyrics Transcription
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 

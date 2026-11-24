@@ -5,7 +5,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import UploadFile
 import httpx
 import yt_dlp
@@ -309,6 +309,8 @@ async def _fetch_tiktok_via_api_fallback(
     job_temp_dir: Path,
     prefix: str,
     audio_only: bool = True,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    max_height: Optional[int] = None,
 ) -> Optional[Tuple[Path, Dict[str, Any]]]:
     """
     Resilient fallback for TikTok links (including TikTok `/music/...` sound pages,
@@ -371,7 +373,12 @@ async def _fetch_tiktok_via_api_fallback(
 
             music_info = data.get("music_info") or {}
             music_url = music_info.get("play") or data.get("music")
-            video_url = data.get("play") or data.get("wmplay")
+            hd_video_url = data.get("hdplay")
+            sd_video_url = data.get("play") or data.get("wmplay")
+            if max_height is not None and max_height <= 540:
+                video_url = sd_video_url or hd_video_url
+            else:
+                video_url = hd_video_url or sd_video_url
 
             # Choose audio stream if audio_only and music_url is available, else video stream
             download_target = (music_url or video_url) if audio_only else (video_url or music_url)
@@ -384,30 +391,50 @@ async def _fetch_tiktok_via_api_fallback(
             ext = ".mp3" if (audio_only and music_url) else ".mp4"
             out_path = job_temp_dir / f"{prefix}{ext}"
 
-            media_resp = await client.get(download_target)
-            if media_resp.status_code != 200 or len(media_resp.content) < 1024:
+            if progress_cb:
+                progress_cb(10, "Connecting to TikTok media stream...")
+            chunks: List[bytes] = []
+            downloaded_bytes = 0
+            async with client.stream("GET", download_target) as media_resp:
+                if media_resp.status_code != 200:
+                    return None
+                total_bytes = int(media_resp.headers.get("content-length") or 0)
+                async for chunk in media_resp.aiter_bytes(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    chunks.append(chunk)
+                    downloaded_bytes += len(chunk)
+                    if progress_cb:
+                        if total_bytes > 0:
+                            pct = min(92, max(12, int((downloaded_bytes / total_bytes) * 85) + 10))
+                            mb_done = downloaded_bytes / (1024 * 1024)
+                            mb_tot = total_bytes / (1024 * 1024)
+                            progress_cb(pct, f"Downloading TikTok video: {pct}% ({mb_done:.1f} / {mb_tot:.1f} MB)")
+                        else:
+                            mb_done = downloaded_bytes / (1024 * 1024)
+                            progress_cb(45, f"Downloading TikTok video... ({mb_done:.1f} MB)")
+
+            if downloaded_bytes < 1024:
                 return None
 
-            out_path.write_bytes(media_resp.content)
+            out_path.write_bytes(b"".join(chunks))
+            if progress_cb:
+                progress_cb(95, "Finalizing downloaded video...")
 
             music_title = (music_info.get("title") or "").strip()
-            post_caption = (data.get("title") or "").strip()
-
-            if _is_generic_tiktok_sound(music_title) and post_caption:
-                title = post_caption
-                alt_title = music_title
+            # Never use the TikTok video's post caption/description (`data.get("title")`)
+            # for song/lyrics search — rely on real music_info or Shazam audio fingerprinting.
+            if _is_generic_tiktok_sound(music_title):
+                title = ""
+                alt_title = ""
+                artist = ""
             else:
-                title = music_title or post_caption or "TikTok Song"
-                alt_title = post_caption if post_caption != title else ""
-
-            artist = (
-                music_info.get("author")
-                or (data.get("author") or {}).get("nickname")
-                or ""
-            )
+                title = music_title
+                alt_title = ""
+                artist = (music_info.get("author") or "").strip()
             duration = float(music_info.get("duration") or data.get("duration") or 0.0)
 
-            logger.info("Downloaded TikTok song/media via API fallback: %s (title=%s, alt=%s)", out_path, title, alt_title)
+            logger.info("Downloaded TikTok song/media via API fallback: %s (title=%r, artist=%r)", out_path, title, artist)
             return out_path, {
                 "title": title,
                 "alt_title": alt_title,
@@ -420,11 +447,127 @@ async def _fetch_tiktok_via_api_fallback(
         return None
 
 
+async def probe_video_qualities(url: str) -> Dict[str, Any]:
+    """
+    Fast metadata-only probe returning available video resolutions (without downloading)
+    for TikTok / YouTube / direct video links so the UI can show a quality dropdown.
+    """
+    clean_target = (url or "").strip()
+    if not clean_target.startswith(("http://", "https://")):
+        return {
+            "title": "",
+            "qualities": [{"value": "best", "label": "✨ Best Available (Auto)"}],
+        }
+
+    qualities: List[Dict[str, str]] = [
+        {"value": "best", "label": "✨ Best Available (Auto)"}
+    ]
+    title = ""
+
+    if "tiktok.com" in clean_target.lower():
+        try:
+            async with create_resilient_async_client(timeout=12.0) as client:
+                resp = await client.get(
+                    "https://www.tikwm.com/api/",
+                    params={"url": clean_target, "hd": 1},
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if isinstance(data, dict) and data:
+                        title = str(data.get("title") or "").strip()
+                        hd_size = int(data.get("hd_size") or 0)
+                        sd_size = int(data.get("size") or 0)
+                        if data.get("hdplay"):
+                            sz_txt = f" (~{hd_size / (1024 * 1024):.1f} MB)" if hd_size > 0 else ""
+                            qualities.append({"value": "1080", "label": f"🎬 HD Original{sz_txt}"})
+                        if data.get("play"):
+                            sz_txt = f" (~{sd_size / (1024 * 1024):.1f} MB)" if sd_size > 0 else ""
+                            qualities.append({"value": "540", "label": f"📱 Standard SD{sz_txt}"})
+                        if len(qualities) > 1:
+                            return {"title": title, "qualities": qualities}
+        except Exception:
+            pass
+
+    def _probe_ytdlp() -> Dict[str, Any]:
+        ydl_opts: Dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "nocheckcertificate": True,
+            "geo_bypass": True,
+            "socket_timeout": 12,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(clean_target, download=False)
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            return info or {}
+
+    try:
+        info = await asyncio.to_thread(_probe_ytdlp)
+        title = str(info.get("title") or title or "").strip()
+        formats = info.get("formats") or []
+        best_audio_bytes = 0
+        for f in formats:
+            if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none"):
+                sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+                if sz > best_audio_bytes:
+                    best_audio_bytes = sz
+
+        height_map: Dict[int, int] = {}
+        for f in formats:
+            vcodec = f.get("vcodec")
+            h = f.get("height")
+            if not h or vcodec in (None, "none"):
+                continue
+            h_int = int(h)
+            if h_int < 144:
+                continue
+            sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+            if sz > 0 and f.get("acodec") in (None, "none") and best_audio_bytes > 0:
+                sz += best_audio_bytes
+            if h_int not in height_map or sz > height_map[h_int]:
+                height_map[h_int] = sz
+
+        tag_names = {
+            2160: "4K UHD",
+            1440: "2K QHD",
+            1080: "Full HD",
+            720: "HD",
+            480: "SD",
+            360: "Low",
+            240: "240p",
+        }
+        for h_val in sorted(height_map.keys(), reverse=True):
+            if h_val not in (2160, 1440, 1080, 720, 480, 360, 240) and h_val < 300:
+                continue
+            sz = height_map[h_val]
+            sz_txt = f" (~{sz / (1024 * 1024):.1f} MB)" if sz > 0 else ""
+            tag = tag_names.get(h_val, f"{h_val}p")
+            label = f"{h_val}p {tag}{sz_txt}" if tag != f"{h_val}p" else f"{h_val}p{sz_txt}"
+            qualities.append({"value": str(h_val), "label": label})
+    except Exception as exc:
+        logger.debug("Quality probe fallback for %s: %s", clean_target, exc)
+
+    if len(qualities) == 1:
+        qualities.extend([
+            {"value": "1080", "label": "🎬 1080p Full HD"},
+            {"value": "720", "label": "📺 720p HD"},
+            {"value": "480", "label": "📱 480p SD"},
+            {"value": "360", "label": "⚡ 360p Fast"},
+        ])
+
+    return {"title": title, "qualities": qualities}
+
+
 async def download_media_from_url(
     url: str,
     job_temp_dir: Path,
     prefix: str = "downloaded_media",
     audio_only: bool = False,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    max_height: Optional[int] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     Download a TikTok/YouTube song or video using yt-dlp (with automatic TikTok API fallback).
@@ -438,6 +581,9 @@ async def download_media_from_url(
     if not clean_target.startswith(("http://", "https://")):
         clean_target = f"ytsearch1:{clean_target}"
 
+    if progress_cb:
+        progress_cb(5, "Resolving video link...")
+
     # For TikTok URLs, try our fast TikTok Music/Video extractor first so even TikTok
     # photo-mode posts and short vt.tiktok.com links work without challenge blocks!
     if is_tiktok:
@@ -446,6 +592,8 @@ async def download_media_from_url(
             job_temp_dir=job_temp_dir,
             prefix=prefix,
             audio_only=audio_only,
+            progress_cb=progress_cb,
+            max_height=max_height,
         )
         if tk_result is not None:
             return tk_result
@@ -462,11 +610,36 @@ async def download_media_from_url(
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    fmt_selector = (
-        "bestaudio[ext=m4a]/bestaudio/best[ext=mp4]/best"
-        if audio_only
-        else "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
-    )
+    if audio_only:
+        fmt_selector = "bestaudio[ext=m4a]/bestaudio/best[ext=mp4]/best"
+    elif max_height and max_height > 0:
+        fmt_selector = (
+            f"best[height<={max_height}][ext=mp4]/"
+            f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={max_height}]+bestaudio/"
+            f"best[height<={max_height}]/"
+            f"best[ext=mp4]/best"
+        )
+    else:
+        fmt_selector = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+
+    def _ydl_progress_hook(d: Dict[str, Any]) -> None:
+        if not progress_cb:
+            return
+        st = d.get("status")
+        if st == "downloading":
+            tot = float(d.get("total_bytes") or d.get("total_bytes_estimate") or 0.0)
+            dl = float(d.get("downloaded_bytes") or 0.0)
+            if tot > 0:
+                pct = min(92, max(10, int((dl / tot) * 85) + 10))
+                progress_cb(
+                    pct,
+                    f"Downloading video: {pct}% ({dl / (1024 * 1024):.1f} / {tot / (1024 * 1024):.1f} MB)",
+                )
+            else:
+                progress_cb(45, f"Downloading video... ({dl / (1024 * 1024):.1f} MB)")
+        elif st == "finished":
+            progress_cb(94, "Processing downloaded video...")
 
     ydl_opts: Dict[str, Any] = {
         "format": fmt_selector,
@@ -479,6 +652,7 @@ async def download_media_from_url(
         "http_headers": base_headers,
         "socket_timeout": 25,
         "retries": 3,
+        "progress_hooks": [_ydl_progress_hook],
     }
     if ffmpeg_bin and ffmpeg_bin != "ffmpeg":
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
@@ -509,15 +683,24 @@ async def download_media_from_url(
                     else:
                         raise RuntimeError(f"yt-dlp finished for {clean_target} but no file was found.")
 
+                    is_tiktok_src = "tiktok.com" in clean_target.lower()
+                    raw_track = (info.get("track") or "").strip()
+                    raw_title = "" if is_tiktok_src else (info.get("title") or "").strip()
+                    if _is_generic_tiktok_sound(raw_track):
+                        raw_track = ""
                     metadata = {
-                        "title": info.get("track") or info.get("title") or "",
-                        "alt_title": info.get("alt_title") or info.get("title") or "",
+                        "title": raw_track or raw_title,
+                        "alt_title": "" if is_tiktok_src else (info.get("alt_title") or info.get("title") or ""),
                         "artist": (
-                            info.get("artist")
-                            or info.get("creator")
-                            or info.get("uploader")
-                            or info.get("channel")
-                            or ""
+                            (info.get("artist") or "")
+                            if is_tiktok_src
+                            else (
+                                info.get("artist")
+                                or info.get("creator")
+                                or info.get("uploader")
+                                or info.get("channel")
+                                or ""
+                            )
                         ),
                         "duration": float(info.get("duration") or 0.0),
                         "webpage_url": info.get("webpage_url") or clean_target,

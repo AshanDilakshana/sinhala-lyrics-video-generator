@@ -1406,8 +1406,9 @@ def _match_line_to_asr_window(
     prefix_bonus = 0.15 if a0 <= 2 else 0.0
     score = 0.45 * line_cov + 0.35 * max(line_cov, win_cov) + 0.20 * min(1.0, density) + prefix_bonus
 
-    is_strong_partial = win_cov >= 0.70 and matched >= 4 and density >= 0.45
-    if (score < 0.56 or density < 0.48) and not is_strong_partial:
+    min_chars_req = 4 if len(line_phonetic) <= 6 else 5
+    is_strong_partial = win_cov >= 0.72 and matched >= min_chars_req and density >= 0.50
+    if matched < min_chars_req or ((score < 0.58 or density < 0.50 or line_cov < 0.38) and not is_strong_partial):
         return None
 
     dur = we - ws
@@ -2572,11 +2573,14 @@ def _score_anchor_chain_for_lines(
     best_idx = int(np.argmax(dp))
     best_len = chain_len[best_idx]
     best_score = float(dp[best_idx])
+    avg_line_score = best_score / max(best_len, 1)
     expected_clip_lines = max(2, int(total_duration / 2.8))
     min_req = min(len(lyric_lines), max(1, min(expected_clip_lines // 3, 3)))
-    if best_len == 1 and best_score < 0.65:
+    if best_len == 1 and best_score < 0.68:
         return 0.0
     if best_len < min_req:
+        return 0.0
+    if len(asr_windows) >= 5 and len(lyric_lines) >= 6 and avg_line_score < 0.68:
         return 0.0
     return best_score
 

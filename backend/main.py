@@ -5,7 +5,9 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,13 +18,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 from backend.config import (
+    CLEANUP_INTERVAL_MINUTES,
     DOWNLOADS_EXPORT_DIR,
     DRAFTS_EXPORT_DIR,
     FONTS_DIR,
     FRONTEND_ORIGIN,
     OUTPUT_DIR,
+    OUTPUT_TTL_HOURS,
     SONGS_CACHE_DIR,
+    TEMP_CACHE_TTL_HOURS,
     TEMP_DIR,
+    TEMP_JOB_TTL_HOURS,
 )
 from backend.models import (
     ColorGradePreset,
@@ -31,6 +37,7 @@ from backend.models import (
     JobStatusResponse,
     LoopMode,
     LyricLine,
+    LyricTransition,
     LyricsResult,
     LyricsSourceTier,
     StylePreset,
@@ -55,6 +62,7 @@ from backend.services.media_service import (
     download_media_from_url,
     extract_audio_from_video,
     get_media_duration,
+    probe_video_qualities,
     save_uploaded_file,
     save_uploaded_visual_clips,
 )
@@ -70,6 +78,110 @@ logging.basicConfig(
 )
 logger = logging.getLogger("backend.main")
 
+
+def _path_latest_mtime(path: Path) -> float:
+    """Return the newest modification timestamp of `path` (or files inside it)."""
+    try:
+        newest = path.stat().st_mtime
+        if path.is_dir():
+            for child in path.rglob("*"):
+                try:
+                    newest = max(newest, child.stat().st_mtime)
+                except OSError:
+                    pass
+        return newest
+    except OSError:
+        return 0.0
+
+
+def cleanup_expired_storage() -> Dict[str, int]:
+    """
+    Auto-expire and delete unused temporary caches, leftover job dirs, and old
+    internal `outputs/` renders based on configured TTLs.
+    Never deletes `DOWNLOADS_EXPORT_DIR`, `DRAFTS_EXPORT_DIR`, `jobs_state.json`,
+    or directories belonging to currently running jobs.
+    """
+    now = time.time()
+    cache_cutoff = now - max(0.25, TEMP_CACHE_TTL_HOURS) * 3600.0
+    job_cutoff = now - max(0.25, TEMP_JOB_TTL_HOURS) * 3600.0
+    output_cutoff = now - max(0.5, OUTPUT_TTL_HOURS) * 3600.0
+
+    active_job_ids = {
+        jid
+        for jid, job in JOBS.items()
+        if job.stage not in (JobStage.COMPLETED, JobStage.FAILED)
+    }
+
+    removed_temp = 0
+    removed_outputs = 0
+
+    if SONGS_CACHE_DIR.exists():
+        for entry in list(SONGS_CACHE_DIR.iterdir()):
+            if _path_latest_mtime(entry) < cache_cutoff:
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                removed_temp += 1
+
+    if TEMP_DIR.exists():
+        for entry in list(TEMP_DIR.iterdir()):
+            if entry.name in ("songs_cache", "jobs_state.json") or entry.name in active_job_ids:
+                continue
+            cutoff = cache_cutoff if entry.name.startswith("fetched_clip_") else job_cutoff
+            if _path_latest_mtime(entry) < cutoff:
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                removed_temp += 1
+
+    if OUTPUT_DIR.exists():
+        for entry in list(OUTPUT_DIR.iterdir()):
+            if entry.stem in active_job_ids:
+                continue
+            if _path_latest_mtime(entry) < output_cutoff:
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                removed_outputs += 1
+
+    if removed_temp or removed_outputs:
+        logger.info(
+            "Auto-cleanup expired %d temp item(s) and %d internal output file(s).",
+            removed_temp,
+            removed_outputs,
+        )
+    return {"removed_temp": removed_temp, "removed_outputs": removed_outputs}
+
+
+async def _periodic_storage_cleanup_loop() -> None:
+    interval_sec = max(60.0, CLEANUP_INTERVAL_MINUTES * 60.0)
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            cleanup_expired_storage()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug("Periodic storage cleanup warning: %s", exc)
+
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    cleanup_expired_storage()
+    cleanup_task = asyncio.create_task(_periodic_storage_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+
 app = FastAPI(
     title="TikTok Aesthetic AI Lyrics Video Editor API",
     description=(
@@ -77,6 +189,7 @@ app = FastAPI(
         "Live Audio-to-Caption Sync Studio, Custom Sinhala Font Manager, and FFmpeg Renderer."
     ),
     version="3.0.0",
+    lifespan=_app_lifespan,
 )
 
 app.add_middleware(
@@ -234,9 +347,9 @@ async def fetch_song_endpoint(
             shutil.rmtree(song_dir, ignore_errors=True)
             raise HTTPException(status_code=499, detail="Song fetching stopped by user.")
 
-        resolved_title = song_name.strip() or meta.get("title") or "Fetched Song"
-        resolved_artist = artist_name.strip() or meta.get("artist") or ""
-        alt_title = meta.get("alt_title") or ""
+        resolved_title = song_name.strip() or (meta.get("title") or "").strip()
+        resolved_artist = artist_name.strip() or (meta.get("artist") or "").strip()
+        alt_title = (meta.get("alt_title") or "").strip()
 
         # Run 3-Tier Lyrics (with Shazam song catching & vocal-anchored alignment)
         lyrics_res = await resolve_synced_lyrics(
@@ -255,7 +368,7 @@ async def fetch_song_endpoint(
             shutil.rmtree(song_dir, ignore_errors=True)
             raise HTTPException(status_code=499, detail="Song fetching stopped by user.")
 
-        final_title = lyrics_res.detected_title or resolved_title
+        final_title = lyrics_res.detected_title or resolved_title or "Fetched Song"
         final_artist = lyrics_res.detected_artist or resolved_artist
 
         # Prune stale song cache folders when count exceeds 20 (preserve draft_* bundles)
@@ -474,6 +587,140 @@ async def serve_song_preview(song_id: str):
         path=str(m4a_file),
         media_type="audio/mp4",
         filename=f"song_{safe_id}.m4a",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+_FETCH_CLIP_PROGRESS: Dict[str, Dict[str, Any]] = {}
+
+
+@app.get("/api/fetch-visual-clip/progress/{progress_id}")
+async def get_fetch_visual_clip_progress(progress_id: str):
+    """Return live download progress (0-100% + status message) for an active video fetch."""
+    safe_pid = Path(progress_id).name
+    return _FETCH_CLIP_PROGRESS.get(
+        safe_pid,
+        {"progress": 0, "message": "Preparing download...", "done": False},
+    )
+
+
+@app.post("/api/fetch-visual-clip/qualities")
+async def probe_visual_clip_qualities_endpoint(
+    video_url: str = Form(...),
+):
+    """Inspect available video qualities/resolutions for a pasted TikTok/YouTube URL."""
+    clean_url = (video_url or "").strip()
+    if not clean_url:
+        return {"title": "", "qualities": [{"value": "best", "label": "✨ Best Available (Auto)"}]}
+    return await probe_video_qualities(clean_url)
+
+
+@app.post("/api/fetch-visual-clip")
+async def fetch_visual_clip_endpoint(
+    request: Request,
+    video_url: str = Form(...),
+    progress_id: str = Form(default=""),
+    quality: str = Form(default="best"),
+):
+    """
+    Download a TikTok / YouTube / direct video URL into temporary cache so the user can
+    add remote video clips directly into the Media & Loop studio without manual downloading.
+    """
+    clean_url = (video_url or "").strip()
+    if not clean_url:
+        raise HTTPException(status_code=400, detail="Please enter a TikTok or YouTube video link.")
+
+    clip_id = uuid.uuid4().hex[:10]
+    safe_pid = Path(progress_id.strip()).name if progress_id.strip() else clip_id
+    clip_dir = TEMP_DIR / f"fetched_clip_{clip_id}"
+    clip_dir.mkdir(parents=True, exist_ok=True)
+
+    def _on_progress(pct: int, msg: str) -> None:
+        _FETCH_CLIP_PROGRESS[safe_pid] = {
+            "progress": max(0, min(100, int(pct))),
+            "message": msg,
+            "done": False,
+        }
+
+    _on_progress(3, "Starting video download...")
+
+    try:
+        from backend.services.media_service import get_media_duration
+
+        clean_q = (quality or "best").strip()
+        max_height = int(clean_q) if clean_q.isdigit() else None
+
+        downloaded_path, meta = await download_media_from_url(
+            url=clean_url,
+            job_temp_dir=clip_dir,
+            prefix="visual",
+            audio_only=False,
+            progress_cb=_on_progress,
+            max_height=max_height,
+        )
+        if await request.is_disconnected():
+            shutil.rmtree(clip_dir, ignore_errors=True)
+            _FETCH_CLIP_PROGRESS.pop(safe_pid, None)
+            raise HTTPException(status_code=499, detail="Video fetching stopped by user.")
+
+        _on_progress(96, "Reading downloaded video metadata...")
+        duration = await get_media_duration(downloaded_path)
+        if duration <= 0.2:
+            shutil.rmtree(clip_dir, ignore_errors=True)
+            _FETCH_CLIP_PROGRESS.pop(safe_pid, None)
+            raise HTTPException(status_code=400, detail="Downloaded file has no valid video stream.")
+
+        # Prune stale fetched_clip_* folders beyond latest 10
+        try:
+            old_clips = [
+                d for d in TEMP_DIR.iterdir()
+                if d.is_dir() and d.name.startswith("fetched_clip_") and d.name != f"fetched_clip_{clip_id}"
+            ]
+            if len(old_clips) > 10:
+                old_clips.sort(key=lambda d: d.stat().st_mtime)
+                for stale in old_clips[: len(old_clips) - 10]:
+                    shutil.rmtree(stale, ignore_errors=True)
+        except Exception:
+            pass
+
+        _FETCH_CLIP_PROGRESS[safe_pid] = {
+            "progress": 100,
+            "message": "Video downloaded! Loading into studio...",
+            "done": True,
+        }
+        return {
+            "status": "ok",
+            "clip_id": clip_id,
+            "filename": downloaded_path.name,
+            "title": (meta.get("title") or "").strip() or downloaded_path.stem,
+            "duration": round(duration, 2),
+            "clip_url": f"/api/fetched-clip/{clip_id}",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        shutil.rmtree(clip_dir, ignore_errors=True)
+        _FETCH_CLIP_PROGRESS.pop(safe_pid, None)
+        raise HTTPException(status_code=400, detail=f"Video fetch failed: {exc}")
+
+
+@app.get("/api/fetched-clip/{clip_id}")
+async def serve_fetched_visual_clip(clip_id: str):
+    """Serve a downloaded remote video clip so the frontend can load it as a studio File."""
+    safe_id = Path(clip_id).name
+    clip_dir = TEMP_DIR / f"fetched_clip_{safe_id}"
+    if not clip_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Fetched video clip not found.")
+    candidates = [p for p in sorted(clip_dir.iterdir()) if p.is_file() and p.name.startswith("visual")]
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Fetched video clip file missing.")
+    clip_path = candidates[0]
+    ext = clip_path.suffix.lower()
+    media_type = "video/webm" if ext == ".webm" else "video/quicktime" if ext == ".mov" else "video/mp4"
+    return FileResponse(
+        path=str(clip_path),
+        media_type=media_type,
+        filename=clip_path.name,
         headers={"Cache-Control": "no-store"},
     )
 
@@ -928,12 +1175,14 @@ async def process_video_endpoint(
     custom_lines_json: str = Form(default=""),
     language: str = Form(default="si"),
     style_preset: StylePreset = Form(default=StylePreset.RW_AESTHETIC_SINHALA),
+    lyric_transition: LyricTransition = Form(default=LyricTransition.AUTO),
+    lyric_animation_speed: float = Form(default=1.0),
     frame_layout: FrameLayout = Form(default=FrameLayout.ROUNDED_SQUARE_CARD),
     color_grade: ColorGradePreset = Form(default=ColorGradePreset.GOLDEN_SUNSET),
     font_family: str = Form(default="Sinhala Sangam MN"),
     font_size: int = Form(default=40),
     font_thickness: float = Form(default=0.0),
-    font_brightness: float = Form(default=1.35),
+    font_brightness: float = Form(default=1.0),
     primary_color_hex: str = Form(default="#FFFFFF"),
     outline_width: float = Form(default=1.8),
     shadow_depth: float = Form(default=2.8),
@@ -946,6 +1195,8 @@ async def process_video_endpoint(
     clip_segments_json: str = Form(default=""),
     loop_mode: LoopMode = Form(default=LoopMode.CROSSFADE),
     video_zoom: float = Form(default=1.0),
+    video_pos_x_percent: float = Form(default=50.0),
+    video_pos_y_percent: float = Form(default=50.0),
     mirror_flip: bool = Form(default=False),
     brightness: float = Form(default=-0.3),
     contrast: float = Form(default=1.0),
@@ -999,6 +1250,8 @@ async def process_video_endpoint(
         frame_layout=frame_layout,
         color_grade=color_grade,
         style_preset=style_preset,
+        lyric_transition=lyric_transition,
+        lyric_animation_speed=lyric_animation_speed,
         font_family=font_family,
         font_size=font_size,
         font_thickness=font_thickness,
@@ -1015,6 +1268,8 @@ async def process_video_endpoint(
         clip_segments_json=clip_segments_json,
         loop_mode=loop_mode,
         video_zoom=video_zoom,
+        video_pos_x_percent=video_pos_x_percent,
+        video_pos_y_percent=video_pos_y_percent,
         mirror_flip=mirror_flip,
         brightness=brightness,
         contrast=contrast,

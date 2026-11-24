@@ -55,6 +55,13 @@ type StylePreset =
   | "tiktok_yellow"
   | "capcut_white_pop"
   | "neon_cyan";
+type LyricTransition =
+  | "auto"
+  | "word_fade"
+  | "soft_fade"
+  | "pop_scale"
+  | "slide_up"
+  | "instant";
 type FrameLayout =
   | "rounded_square_card"
   | "rounded_portrait_card"
@@ -578,6 +585,17 @@ export default function TikTokLyricsVideoEditor() {
   const [clipPreviewUrls, setClipPreviewUrls] = useState<string[]>([]);
   const [selectedSingleClipIdx, setSelectedSingleClipIdx] = useState<number | null>(null);
   const [detectedClipDuration, setDetectedClipDuration] = useState<number>(0);
+  const [visualFetchUrl, setVisualFetchUrl] = useState<string>("");
+  const [isFetchingVisualClip, setIsFetchingVisualClip] = useState<boolean>(false);
+  const [visualFetchProgress, setVisualFetchProgress] = useState<number>(0);
+  const [visualFetchMsg, setVisualFetchMsg] = useState<string | null>(null);
+  const [visualFetchQuality, setVisualFetchQuality] = useState<string>("best");
+  const [visualQualityOptions, setVisualQualityOptions] = useState<
+    { value: string; label: string }[]
+  >([{ value: "best", label: "✨ Best Available (Auto)" }]);
+  const [isProbingVisualQualities, setIsProbingVisualQualities] = useState<boolean>(false);
+  const fetchVisualAbortRef = useRef<AbortController | null>(null);
+  const visualProbeAbortRef = useRef<AbortController | null>(null);
 
   // 2. Simple Video Editing Tools State
   const [clipSpeed, setClipSpeed] = useState<number>(1.0);
@@ -588,6 +606,15 @@ export default function TikTokLyricsVideoEditor() {
   const [isVideoBladeMode, setIsVideoBladeMode] = useState<boolean>(false);
   const [loopMode, setLoopMode] = useState<LoopMode>("crossfade");
   const [videoZoom, setVideoZoom] = useState<number>(1.0);
+  const [videoPosXPercent, setVideoPosXPercent] = useState<number>(50);
+  const [videoPosYPercent, setVideoPosYPercent] = useState<number>(50);
+  const [isDraggingVideoAlign, setIsDraggingVideoAlign] = useState<boolean>(false);
+  const videoAlignDragRef = useRef<{
+    startX: number;
+    startY: number;
+    origPosX: number;
+    origPosY: number;
+  } | null>(null);
   const [mirrorFlip, setMirrorFlip] = useState<boolean>(false);
   const [brightness, setBrightness] = useState<number>(-0.3);
   const [contrast, setContrast] = useState<number>(1.0);
@@ -786,7 +813,7 @@ export default function TikTokLyricsVideoEditor() {
 
   const [fontSize, setFontSize] = useState<number>(40);
   const [fontThickness, setFontThickness] = useState<number>(0);
-  const [fontBrightness, setFontBrightness] = useState<number>(1.35);
+  const [fontBrightness, setFontBrightness] = useState<number>(1.0);
   const [selectedStartLineIdx, setSelectedStartLineIdx] = useState<number>(-1);
   const [primaryColorHex, setPrimaryColorHex] = useState<string>("#FFFFFF");
   const [outlineWidth, setOutlineWidth] = useState<number>(1.8);
@@ -799,6 +826,8 @@ export default function TikTokLyricsVideoEditor() {
   const [frameLayout, setFrameLayout] = useState<FrameLayout>("rounded_square_card");
   const [colorGrade, setColorGrade] = useState<ColorGradePreset>("golden_sunset");
   const [stylePreset, setStylePreset] = useState<StylePreset>("rw_aesthetic_sinhala");
+  const [lyricTransition, setLyricTransition] = useState<LyricTransition>("auto");
+  const [lyricAnimationSpeed, setLyricAnimationSpeed] = useState<number>(1.0);
   const [blurInterval, setBlurInterval] = useState<number>(0);
   const [cornerRadius, setCornerRadius] = useState<number>(48);
   const [watermarkText, setWatermarkText] = useState<string>("The_Black Hart 🖤");
@@ -1065,8 +1094,8 @@ export default function TikTokLyricsVideoEditor() {
         typeof data.duration === "number" && data.duration > 0
           ? data.duration
           : typeof data.song_duration === "number" && data.song_duration > 0
-          ? data.song_duration
-          : null;
+            ? data.song_duration
+            : null;
       if (restoredDur !== null) {
         setFetchedSongDuration(restoredDur);
         setRawSongDuration(restoredDur);
@@ -1085,6 +1114,8 @@ export default function TikTokLyricsVideoEditor() {
       if (typeof cfg.frame_layout === "string") setFrameLayout(cfg.frame_layout as FrameLayout);
       if (typeof cfg.color_grade === "string") setColorGrade(cfg.color_grade as ColorGradePreset);
       if (typeof cfg.style_preset === "string") setStylePreset(cfg.style_preset as StylePreset);
+      if (typeof cfg.lyric_transition === "string") setLyricTransition(cfg.lyric_transition as LyricTransition);
+      if (typeof cfg.lyric_animation_speed === "number") setLyricAnimationSpeed(cfg.lyric_animation_speed);
       if (typeof cfg.font_family === "string") setSelectedFontFamily(cfg.font_family);
       if (typeof cfg.font_size === "number") setFontSize(cfg.font_size);
       if (typeof cfg.font_thickness === "number") setFontThickness(cfg.font_thickness);
@@ -1110,6 +1141,8 @@ export default function TikTokLyricsVideoEditor() {
       }
       if (typeof cfg.loop_mode === "string") setLoopMode(cfg.loop_mode as LoopMode);
       if (typeof cfg.video_zoom === "number") setVideoZoom(cfg.video_zoom);
+      if (typeof cfg.video_pos_x_percent === "number") setVideoPosXPercent(cfg.video_pos_x_percent);
+      if (typeof cfg.video_pos_y_percent === "number") setVideoPosYPercent(cfg.video_pos_y_percent);
       if (typeof cfg.mirror_flip === "boolean") setMirrorFlip(cfg.mirror_flip);
       if (typeof cfg.brightness === "number") setBrightness(cfg.brightness);
       if (typeof cfg.contrast === "number") setContrast(cfg.contrast);
@@ -1270,6 +1303,8 @@ export default function TikTokLyricsVideoEditor() {
           if (Array.isArray(s.videoSegments)) setVideoSegments(s.videoSegments);
           if (typeof s.loopMode === "string") setLoopMode(s.loopMode);
           if (typeof s.videoZoom === "number") setVideoZoom(s.videoZoom);
+          if (typeof s.videoPosXPercent === "number") setVideoPosXPercent(s.videoPosXPercent);
+          if (typeof s.videoPosYPercent === "number") setVideoPosYPercent(s.videoPosYPercent);
           if (typeof s.mirrorFlip === "boolean") setMirrorFlip(s.mirrorFlip);
           if (s.defaultsVersion === 2 && typeof s.brightness === "number") {
             setBrightness(s.brightness);
@@ -1315,10 +1350,10 @@ export default function TikTokLyricsVideoEditor() {
           }
           if (typeof s.fontSize === "number") setFontSize(s.fontSize);
           if (typeof s.fontThickness === "number") setFontThickness(s.fontThickness);
-          if (s.defaultsVersion === 2 && typeof s.fontBrightness === "number") {
+          if (s.defaultsVersion === 3 && typeof s.fontBrightness === "number") {
             setFontBrightness(s.fontBrightness);
           } else {
-            setFontBrightness(1.35);
+            setFontBrightness(1.0);
           }
           if (typeof s.primaryColorHex === "string") setPrimaryColorHex(s.primaryColorHex);
           if (typeof s.outlineWidth === "number") setOutlineWidth(s.outlineWidth);
@@ -1408,7 +1443,7 @@ export default function TikTokLyricsVideoEditor() {
   useEffect(() => {
     if (!isProjectHydrated) return;
     const payload = {
-      defaultsVersion: 2,
+      defaultsVersion: 3,
       activeSidebarTab,
       timelineViewMode,
       timelineZoom,
@@ -1420,6 +1455,8 @@ export default function TikTokLyricsVideoEditor() {
       videoSegments,
       loopMode,
       videoZoom,
+      videoPosXPercent,
+      videoPosYPercent,
       mirrorFlip,
       brightness,
       contrast,
@@ -1493,6 +1530,8 @@ export default function TikTokLyricsVideoEditor() {
     videoSegments,
     loopMode,
     videoZoom,
+    videoPosXPercent,
+    videoPosYPercent,
     mirrorFlip,
     brightness,
     contrast,
@@ -1554,6 +1593,8 @@ export default function TikTokLyricsVideoEditor() {
       videoSegments,
       loopMode,
       videoZoom,
+      videoPosXPercent,
+      videoPosYPercent,
       mirrorFlip,
       brightness,
       contrast,
@@ -1605,6 +1646,8 @@ export default function TikTokLyricsVideoEditor() {
       setVideoSegments(Array.isArray(s.videoSegments) ? s.videoSegments : []);
       setLoopMode(s.loopMode ?? "crossfade");
       setVideoZoom(s.videoZoom ?? 1.0);
+      setVideoPosXPercent(typeof s.videoPosXPercent === "number" ? s.videoPosXPercent : 50);
+      setVideoPosYPercent(typeof s.videoPosYPercent === "number" ? s.videoPosYPercent : 50);
       setMirrorFlip(Boolean(s.mirrorFlip));
       setBrightness(s.brightness ?? -0.3);
       setContrast(s.contrast ?? 1.0);
@@ -1624,7 +1667,7 @@ export default function TikTokLyricsVideoEditor() {
       setSelectedFontFamily(s.selectedFontFamily ?? defaultFontFamily);
       setFontSize(s.fontSize ?? 40);
       setFontThickness(s.fontThickness ?? 0);
-      setFontBrightness(s.fontBrightness ?? 1.35);
+      setFontBrightness(s.fontBrightness ?? 1.0);
       setPrimaryColorHex(s.primaryColorHex ?? "#FFFFFF");
       setOutlineWidth(s.outlineWidth ?? 1.8);
       setShadowDepth(s.shadowDepth ?? 2.8);
@@ -1686,6 +1729,8 @@ export default function TikTokLyricsVideoEditor() {
     videoSegments,
     loopMode,
     videoZoom,
+    videoPosXPercent,
+    videoPosYPercent,
     mirrorFlip,
     brightness,
     contrast,
@@ -1812,9 +1857,11 @@ export default function TikTokLyricsVideoEditor() {
     setIsVideoBladeMode(false);
     setLoopMode("crossfade");
     setVideoZoom(1.0);
+    setVideoPosXPercent(50);
+    setVideoPosYPercent(50);
     setMirrorFlip(false);
     setBrightness(-0.3);
-    setFontBrightness(1.35);
+    setFontBrightness(1.0);
     setSelectedStartLineIdx(-1);
     setContrast(1.0);
     setSaturation(1.0);
@@ -2332,7 +2379,11 @@ export default function TikTokLyricsVideoEditor() {
       }
       setSelectedStartLineIdx(-1);
       if (typeof data.fetched_lyrics === "string" && data.fetched_lyrics.trim()) {
-        setManualLyrics(data.fetched_lyrics);
+        const curLines = manualLyrics.split("\n").filter((l) => l.trim()).length;
+        const newLines = data.fetched_lyrics.split("\n").filter((l: string) => l.trim()).length;
+        if (!manualLyrics.trim() || newLines >= curLines) {
+          setManualLyrics(data.fetched_lyrics);
+        }
       }
       const msg = `Cut song from ${formatMmSs(effectiveStart)} (${data.duration}s) & synced ${data.aligned_lines?.length || 0
         } captions!`;
@@ -2617,10 +2668,175 @@ export default function TikTokLyricsVideoEditor() {
     return segs[0].start;
   };
 
-  const handleBladeVideoSegmentAtSourceTime = (segIdx: number, rawCutSourceSec: number) => {
+  const handleStopFetchVisualClip = () => {
+    if (fetchVisualAbortRef.current) {
+      fetchVisualAbortRef.current.abort();
+      fetchVisualAbortRef.current = null;
+    }
+    setIsFetchingVisualClip(false);
+    setVisualFetchMsg("Video fetching stopped by user.");
+    showToast("⏹ Video fetching stopped");
+  };
+
+  useEffect(() => {
+    const cleanUrl = visualFetchUrl.trim();
+    if (!/^https?:\/\/\S{6,}/i.test(cleanUrl)) {
+      if (visualProbeAbortRef.current) {
+        visualProbeAbortRef.current.abort();
+      }
+      setIsProbingVisualQualities(false);
+      setVisualQualityOptions([{ value: "best", label: "✨ Best Available (Auto)" }]);
+      setVisualFetchQuality("best");
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      if (visualProbeAbortRef.current) {
+        visualProbeAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      visualProbeAbortRef.current = controller;
+      setIsProbingVisualQualities(true);
+      try {
+        const fd = new FormData();
+        fd.append("video_url", cleanUrl);
+        const res = await fetch(`${API_BASE}/api/fetch-visual-clip/qualities`, {
+          method: "POST",
+          body: fd,
+          signal: controller.signal,
+        });
+        if (!res.ok) return;
+        const data = await res.json().catch(() => ({}));
+        if (Array.isArray(data.qualities) && data.qualities.length > 0) {
+          setVisualQualityOptions(data.qualities);
+          setVisualFetchQuality((prev) =>
+            data.qualities.some((q: { value: string }) => q.value === prev)
+              ? prev
+              : data.qualities[0].value
+          );
+        }
+      } catch {
+        // ignore abort / transient probe error
+      } finally {
+        setIsProbingVisualQualities(false);
+      }
+    }, 450);
+
+    return () => window.clearTimeout(timer);
+  }, [visualFetchUrl]);
+
+  const handleFetchVisualClip = async () => {
+    const cleanUrl = visualFetchUrl.trim();
+    if (!cleanUrl) {
+      showToast("Paste a TikTok or YouTube video link first");
+      return;
+    }
+    if (fetchVisualAbortRef.current) {
+      fetchVisualAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    fetchVisualAbortRef.current = controller;
+    const progressId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    setIsFetchingVisualClip(true);
+    setVisualFetchProgress(4);
+    setVisualFetchMsg("Connecting & starting video download...");
+    setUiError(null);
+
+    const pollTimer = window.setInterval(async () => {
+      try {
+        const pRes = await fetch(`${API_BASE}/api/fetch-visual-clip/progress/${progressId}`, {
+          signal: controller.signal,
+        });
+        if (pRes.ok) {
+          const pData = await pRes.json();
+          if (typeof pData.progress === "number") {
+            setVisualFetchProgress((prev) => Math.max(prev, Math.min(95, pData.progress)));
+          }
+          if (typeof pData.message === "string" && pData.message) {
+            setVisualFetchMsg(pData.message);
+          }
+        }
+      } catch {
+        // ignore transient polling errors
+      }
+    }, 350);
+
+    try {
+      const formData = new FormData();
+      formData.append("video_url", cleanUrl);
+      formData.append("progress_id", progressId);
+      formData.append("quality", visualFetchQuality);
+      const res = await fetch(`${API_BASE}/api/fetch-visual-clip`, {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      });
+      window.clearInterval(pollTimer);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || "Could not fetch video from URL.");
+      }
+
+      setVisualFetchProgress(96);
+      setVisualFetchMsg("Loading downloaded video into studio...");
+      const clipRes = await fetch(`${API_BASE}${data.clip_url}`, {
+        signal: controller.signal,
+      });
+      if (!clipRes.ok) {
+        throw new Error("Could not stream fetched video file into browser.");
+      }
+      const blob = await clipRes.blob();
+      setVisualFetchProgress(100);
+      const rawName = String(data.title || data.filename || "fetched_video")
+        .replace(/[^\w\s-]/g, "")
+        .trim()
+        .slice(0, 32);
+      const safeFileName = `${rawName || "fetched_video"}_${data.clip_id}.mp4`;
+      const clipFile = new File([blob], safeFileName, {
+        type: blob.type || "video/mp4",
+      });
+
+      userModifiedMediaRef.current = true;
+      setVisualClips((prev) => [...prev, clipFile]);
+      setVisualFetchUrl("");
+      const msg = `✅ Loaded video "${safeFileName}" (${data.duration}s)!`;
+      setVisualFetchMsg(msg);
+      showToast(msg);
+    } catch (err: any) {
+      window.clearInterval(pollTimer);
+      if (err?.name === "AbortError") {
+        setVisualFetchProgress(0);
+        setVisualFetchMsg("Video fetching stopped by user.");
+        return;
+      }
+      const errMsg = err?.message || "Failed to fetch video clip";
+      setVisualFetchProgress(0);
+      setVisualFetchMsg(`Error: ${errMsg}`);
+      showToast(`Video fetch failed: ${errMsg}`);
+    } finally {
+      window.clearInterval(pollTimer);
+      if (fetchVisualAbortRef.current === controller) {
+        fetchVisualAbortRef.current = null;
+        setIsFetchingVisualClip(false);
+      }
+    }
+  };
+
+  const handleBladeVideoSegmentAtSourceTime = (
+    segIdx: number,
+    rawCutSourceSec: number,
+    keepBladeOn = false
+  ) => {
     if (visualClips.length === 0) {
       showToast("Upload a video clip first to use the Cut / Blade tool");
       return;
+    }
+    if (
+      detectedClipDuration <= 0 &&
+      previewVideoRef.current?.duration &&
+      isFinite(previewVideoRef.current.duration)
+    ) {
+      setDetectedClipDuration(Number(previewVideoRef.current.duration.toFixed(2)));
     }
     const segs = [...effectiveVideoSegments];
     const targetIdx = segs[segIdx] ? segIdx : 0;
@@ -2637,8 +2853,10 @@ export default function TikTokLyricsVideoEditor() {
     const rightPart = { start: cutSourceSec, end: chosenSeg.end };
     const nextSegs = [...segs.slice(0, targetIdx), leftPart, rightPart, ...segs.slice(targetIdx + 1)];
     syncTrimFromSegments(nextSegs);
-    setSelectedVideoSegmentIdx(targetIdx);
-    setIsVideoBladeMode(false);
+    setSelectedVideoSegmentIdx(targetIdx + 1);
+    if (!keepBladeOn) {
+      setIsVideoBladeMode(false);
+    }
     showToast(
       `✂️ Cut video at ${cutSourceSec.toFixed(1)}s → Part #${targetIdx + 1} (${leftPart.start.toFixed(1)}s–${leftPart.end.toFixed(1)}s) & Part #${targetIdx + 2} (${rightPart.start.toFixed(1)}s–${rightPart.end.toFixed(1)}s). Click unwanted part & press 🗑️ Delete!`
     );
@@ -2655,12 +2873,12 @@ export default function TikTokLyricsVideoEditor() {
       0.5,
       segs.reduce((acc, s) => acc + Math.max(0.2, (s.end - s.start) / speed), 0)
     );
-    const hasActiveAudioPlayhead = (audioRef.current?.currentTime ?? currentAudioTime ?? 0) > 0.15;
+    const activeTimelineSec = Math.max(audioRef.current?.currentTime ?? 0, currentAudioTime ?? 0);
     const rawPlayhead =
       explicitTimelineSec !== undefined
         ? explicitTimelineSec
-        : hasActiveAudioPlayhead
-          ? Number((audioRef.current?.currentTime ?? currentAudioTime ?? 0).toFixed(2))
+        : activeTimelineSec > 0.15
+          ? Number(activeTimelineSec.toFixed(2))
           : Number((previewVideoRef.current?.currentTime ?? 0).toFixed(2));
     const loopOffset = ((rawPlayhead % totalKeptTimelineDur) + totalKeptTimelineDur) % totalKeptTimelineDur;
 
@@ -2709,7 +2927,9 @@ export default function TikTokLyricsVideoEditor() {
           : 0;
 
     if (segs.length <= 1) {
-      handleRemoveVisualClip(0);
+      showToast(
+        "✂️ Split the video first with Blade / Razor (or use Trim [ In / Out ]) to remove a section. To remove the video file, use Tab 1 Media."
+      );
       return;
     }
 
@@ -2733,6 +2953,30 @@ export default function TikTokLyricsVideoEditor() {
     setClipTrimStart(0);
     setClipTrimEnd(0);
     showToast("🔄 Restored full original main video");
+  };
+
+  const handleTrimVideoAtPlayhead = (edge: "in" | "out") => {
+    if (visualClips.length === 0) {
+      showToast("Upload a video clip first to trim");
+      return;
+    }
+    const rawPlayhead = Number((audioRef.current?.currentTime ?? currentAudioTime ?? 0).toFixed(2));
+    const srcSec = mapTimelineSecToVideoSourceSec(rawPlayhead);
+    const maxEnd = Math.max(1.0, detectedClipDuration || baseRawClipDur);
+    const curStart = effectiveVideoSegments[0]?.start ?? 0;
+    const curEnd = effectiveVideoSegments[effectiveVideoSegments.length - 1]?.end ?? maxEnd;
+
+    if (edge === "in") {
+      const nextStart = Math.max(0, Math.min(srcSec, curEnd - 0.5));
+      syncTrimFromSegments([{ start: nextStart, end: curEnd }]);
+      setSelectedVideoSegmentIdx(0);
+      showToast(`🎬 Video Trim In set to ${nextStart.toFixed(1)}s (kept ${nextStart.toFixed(1)}s–${curEnd.toFixed(1)}s)`);
+    } else {
+      const nextEnd = Math.min(maxEnd, Math.max(srcSec, curStart + 0.5));
+      syncTrimFromSegments([{ start: curStart, end: nextEnd }]);
+      setSelectedVideoSegmentIdx(0);
+      showToast(`🎬 Video Trim Out set to ${nextEnd.toFixed(1)}s (kept ${curStart.toFixed(1)}s–${nextEnd.toFixed(1)}s)`);
+    }
   };
 
   const handleMoveClip = (index: number, direction: -1 | 1) => {
@@ -3087,6 +3331,8 @@ export default function TikTokLyricsVideoEditor() {
       formData.append("frame_layout", frameLayout);
       formData.append("color_grade", colorGrade);
       formData.append("style_preset", stylePreset);
+      formData.append("lyric_transition", lyricTransition);
+      formData.append("lyric_animation_speed", String(lyricAnimationSpeed));
 
       formData.append("font_family", selectedFontFamily);
       formData.append("font_size", String(fontSize));
@@ -3107,6 +3353,8 @@ export default function TikTokLyricsVideoEditor() {
       }
       formData.append("loop_mode", loopMode);
       formData.append("video_zoom", String(videoZoom));
+      formData.append("video_pos_x_percent", String(videoPosXPercent));
+      formData.append("video_pos_y_percent", String(videoPosYPercent));
       formData.append("mirror_flip", String(mirrorFlip));
       formData.append("brightness", String(brightness));
       formData.append("contrast", String(contrast));
@@ -3202,13 +3450,15 @@ export default function TikTokLyricsVideoEditor() {
     return isBlurPulseActive ? `${baseFilter} blur(3.5px)` : baseFilter;
   };
 
-  const totalTimelineDuration = Math.max(
-    fetchedSongDuration || 0,
-    job?.song_duration || 0,
-    editableTimeline.length > 0 ? editableTimeline[editableTimeline.length - 1].end + 2 : 0,
-    detectedClipDuration || 0,
-    30
-  );
+  const activeSongDur = fetchedSongDuration || job?.song_duration || 0;
+  const totalTimelineDuration =
+    activeSongDur > 0
+      ? activeSongDur
+      : Math.max(
+          editableTimeline.length > 0 ? editableTimeline[editableTimeline.length - 1].end + 2 : 0,
+          detectedClipDuration || 0,
+          30
+        );
 
   // Smooth direct drag-move & edge-resize for caption blocks on Track 1 + ruler scrubbing
   useEffect(() => {
@@ -3312,6 +3562,44 @@ export default function TikTokLyricsVideoEditor() {
       window.removeEventListener("pointercancel", onPointerUp);
     };
   }, [dragCaptionState, isScrubbingRuler, totalTimelineDuration, detectedClipDuration]);
+
+  // Cursor drag on the Live 9:16 Preview Card to adjust video X/Y framing alignment
+  useEffect(() => {
+    if (!isDraggingVideoAlign) return;
+    const onPointerMove = (e: PointerEvent) => {
+      const drag = videoAlignDragRef.current;
+      const cardEl = previewCardRef.current;
+      if (!drag || !cardEl) return;
+      const rect = cardEl.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+
+      const dx = e.clientX - drag.startX;
+      const dy = e.clientY - drag.startY;
+      const dirX = mirrorFlip ? 1 : -1;
+      const nextX = Math.max(
+        0,
+        Math.min(100, Math.round(drag.origPosX + dirX * (dx / rect.width) * 120))
+      );
+      const nextY = Math.max(
+        0,
+        Math.min(100, Math.round(drag.origPosY - (dy / rect.height) * 120))
+      );
+      setVideoPosXPercent(nextX);
+      setVideoPosYPercent(nextY);
+    };
+    const onPointerUp = () => {
+      videoAlignDragRef.current = null;
+      setIsDraggingVideoAlign(false);
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+  }, [isDraggingVideoAlign, mirrorFlip]);
 
   const effectiveClipLen = Math.max(
     1.0,
@@ -3989,6 +4277,93 @@ export default function TikTokLyricsVideoEditor() {
                 />
               </label>
 
+              {/* Fetch Video Clip Directly from TikTok / YouTube URL */}
+              <div className="rounded-xl border border-zinc-800 bg-zinc-950/90 p-3 space-y-2">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="font-bold text-sky-300">
+                    🌐 Fetch Video from Link (TikTok / YouTube)
+                  </span>
+                  <span className="text-[10px] text-zinc-500">Auto-download &amp; load</span>
+                </div>
+                <div className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={visualFetchUrl}
+                    onChange={(e) => setVisualFetchUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleFetchVisualClip();
+                      }
+                    }}
+                    placeholder="Paste TikTok or YouTube video URL..."
+                    className="flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 focus:border-sky-400 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    disabled={isFetchingVisualClip || !visualFetchUrl.trim()}
+                    onClick={handleFetchVisualClip}
+                    className="shrink-0 rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-extrabold text-black transition hover:bg-sky-400 disabled:opacity-40"
+                  >
+                    {isFetchingVisualClip ? "Fetching..." : "Fetch Video"}
+                  </button>
+                  {isFetchingVisualClip && (
+                    <button
+                      type="button"
+                      onClick={handleStopFetchVisualClip}
+                      className="shrink-0 rounded-lg border border-rose-500/50 bg-rose-500/20 px-2.5 py-1.5 text-xs font-extrabold text-rose-200 hover:bg-rose-500/35"
+                    >
+                      ⏹
+                    </button>
+                  )}
+                </div>
+                {visualFetchUrl.trim().length > 0 && (
+                  <div className="flex items-center gap-2 pt-0.5">
+                    <label className="shrink-0 text-[10px] font-semibold text-zinc-400">
+                      Quality:
+                    </label>
+                    <select
+                      value={visualFetchQuality}
+                      onChange={(e) => setVisualFetchQuality(e.target.value)}
+                      disabled={isFetchingVisualClip}
+                      className="flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-[11px] text-zinc-100 focus:border-sky-400 focus:outline-none disabled:opacity-50"
+                    >
+                      {visualQualityOptions.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                    {isProbingVisualQualities && (
+                      <span className="shrink-0 text-[10px] text-sky-400 animate-pulse">
+                        Checking...
+                      </span>
+                    )}
+                  </div>
+                )}
+                {(isFetchingVisualClip || visualFetchMsg) && (
+                  <div className="space-y-1.5 pt-0.5">
+                    {isFetchingVisualClip && (
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[10px] font-semibold text-sky-300">
+                          <span>{visualFetchMsg || "Downloading video..."}</span>
+                          <span className="font-mono">{visualFetchProgress}%</span>
+                        </div>
+                        <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                          <div
+                            className="h-full rounded-full bg-sky-400 transition-all duration-300"
+                            style={{ width: `${Math.max(4, visualFetchProgress)}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                    {!isFetchingVisualClip && visualFetchMsg && (
+                      <p className="text-[11px] text-zinc-400">{visualFetchMsg}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+
               {visualClips.length > 0 && (
                 <div className="space-y-2">
                   {visualClips.length > 1 && (
@@ -4174,6 +4549,7 @@ export default function TikTokLyricsVideoEditor() {
                             </span>
                             <button
                               type="button"
+                              disabled={effectiveVideoSegments.length <= 1}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 handleDeleteVideoSegment(sIdx);
@@ -4181,12 +4557,12 @@ export default function TikTokLyricsVideoEditor() {
                               title={
                                 effectiveVideoSegments.length > 1
                                   ? "Delete this cut video part"
-                                  : "Delete main video clip"
+                                  : "Split the video first using Blade Split to delete a part"
                               }
-                              className="inline-flex items-center gap-1 rounded border border-red-500/40 bg-red-500/15 px-2 py-0.5 text-[10px] font-bold text-red-300 hover:bg-red-500/30"
+                              className="inline-flex items-center gap-1 rounded border border-red-500/40 bg-red-500/15 px-2 py-0.5 text-[10px] font-bold text-red-300 hover:bg-red-500/30 disabled:opacity-35 disabled:cursor-not-allowed"
                             >
                               <Trash2 className="h-2.5 w-2.5" />
-                              {effectiveVideoSegments.length > 1 ? "Delete Part" : "Delete Video"}
+                              Delete Part
                             </button>
                           </div>
                         );
@@ -4211,6 +4587,8 @@ export default function TikTokLyricsVideoEditor() {
                       setVideoSegments([]);
                       setSelectedVideoSegmentIdx(null);
                       setVideoZoom(1.0);
+                      setVideoPosXPercent(50);
+                      setVideoPosYPercent(50);
                       setMirrorFlip(false);
                       setLoopMode("crossfade");
                     }}
@@ -4241,32 +4619,94 @@ export default function TikTokLyricsVideoEditor() {
                   </select>
                 </div>
 
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="mb-1 block text-[11px] text-zinc-400">
-                      Clip Trim Start (s)
-                    </label>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.5"
-                      value={clipTrimStart}
-                      onChange={(e) => setClipTrimStart(parseFloat(e.target.value) || 0)}
-                      className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-100"
-                    />
+                <div className="space-y-2 rounded-lg border border-sky-500/25 bg-zinc-900/50 p-2.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-semibold text-sky-300">
+                      ✂️ Video Trim Range (වීඩියෝව Trim කරන්න)
+                    </span>
+                    <span className="font-mono text-[10px] text-zinc-400">
+                      {clipTrimStart.toFixed(1)}s →{" "}
+                      {(clipTrimEnd > 0
+                        ? Math.min(baseRawClipDur, clipTrimStart + clipTrimEnd)
+                        : baseRawClipDur
+                      ).toFixed(1)}s
+                    </span>
                   </div>
-                  <div>
-                    <label className="mb-1 block text-[11px] text-zinc-400">
-                      Clip Max Len (0=Full)
-                    </label>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.5"
-                      value={clipTrimEnd}
-                      onChange={(e) => setClipTrimEnd(parseFloat(e.target.value) || 0)}
-                      className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-100"
-                    />
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="mb-1 block text-[11px] text-zinc-400">
+                        Trim Start (s)
+                      </label>
+                      <input
+                        type="range"
+                        min="0"
+                        max={Math.max(0.5, baseRawClipDur - 0.5)}
+                        step="0.1"
+                        value={Math.min(clipTrimStart, Math.max(0, baseRawClipDur - 0.5))}
+                        onChange={(e) => {
+                          const s = parseFloat(e.target.value) || 0;
+                          const curEnd =
+                            clipTrimEnd > 0
+                              ? Math.min(baseRawClipDur, clipTrimStart + clipTrimEnd)
+                              : baseRawClipDur;
+                          const safeEnd = Math.max(s + 0.5, curEnd);
+                          syncTrimFromSegments([{ start: s, end: Math.min(baseRawClipDur, safeEnd) }]);
+                        }}
+                        className="w-full accent-sky-400"
+                      />
+                      <input
+                        type="number"
+                        min="0"
+                        max={Math.max(0, baseRawClipDur - 0.5)}
+                        step="0.5"
+                        value={clipTrimStart}
+                        onChange={(e) => {
+                          const s = Math.max(0, parseFloat(e.target.value) || 0);
+                          const curEnd =
+                            clipTrimEnd > 0
+                              ? Math.min(baseRawClipDur, clipTrimStart + clipTrimEnd)
+                              : baseRawClipDur;
+                          syncTrimFromSegments([{ start: s, end: Math.max(s + 0.5, curEnd) }]);
+                        }}
+                        className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-[11px] text-zinc-400">
+                        Trim End (s) / Max Len (0=Full)
+                      </label>
+                      <input
+                        type="range"
+                        min={Math.min(baseRawClipDur, clipTrimStart + 0.5)}
+                        max={baseRawClipDur}
+                        step="0.1"
+                        value={
+                          clipTrimEnd > 0
+                            ? Math.min(baseRawClipDur, clipTrimStart + clipTrimEnd)
+                            : baseRawClipDur
+                        }
+                        onChange={(e) => {
+                          const endVal = parseFloat(e.target.value) || baseRawClipDur;
+                          syncTrimFromSegments([{ start: clipTrimStart, end: Math.max(clipTrimStart + 0.5, endVal) }]);
+                        }}
+                        className="w-full accent-sky-400"
+                      />
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.5"
+                        value={clipTrimEnd}
+                        onChange={(e) => {
+                          const len = Math.max(0, parseFloat(e.target.value) || 0);
+                          if (len === 0) {
+                            syncTrimFromSegments([{ start: clipTrimStart, end: baseRawClipDur }]);
+                          } else {
+                            syncTrimFromSegments([{ start: clipTrimStart, end: Math.min(baseRawClipDur, clipTrimStart + len) }]);
+                          }
+                        }}
+                        className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-100"
+                      />
+                    </div>
                   </div>
                 </div>
 
@@ -4294,12 +4734,31 @@ export default function TikTokLyricsVideoEditor() {
                   <input
                     type="range"
                     min="1.0"
-                    max="1.5"
+                    max="2.5"
                     step="0.05"
                     value={videoZoom}
                     onChange={(e) => setVideoZoom(parseFloat(e.target.value))}
                     className="w-full accent-amber-400"
                   />
+                  <div className="mt-1.5 flex items-center justify-between text-[10px] text-zinc-400">
+                    <span>
+                      ✥ Video Alignment: <span className="font-mono text-sky-300">{videoPosXPercent}% X</span> •{" "}
+                      <span className="font-mono text-sky-300">{videoPosYPercent}% Y</span>{" "}
+                      <span className="text-zinc-500">(Drag preview directly)</span>
+                    </span>
+                    {(videoPosXPercent !== 50 || videoPosYPercent !== 50) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setVideoPosXPercent(50);
+                          setVideoPosYPercent(50);
+                        }}
+                        className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-[9px] text-amber-300 hover:border-amber-400"
+                      >
+                        Center
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-between pt-1">
@@ -5759,6 +6218,74 @@ export default function TikTokLyricsVideoEditor() {
                 </div>
 
                 <div>
+                  <label className="mb-1 block text-xs font-medium text-zinc-300">
+                    Lyric Transition (මාරු වන ආකාරය)
+                  </label>
+                  <select
+                    value={lyricTransition}
+                    onChange={(e) => setLyricTransition(e.target.value as LyricTransition)}
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-zinc-100"
+                  >
+                    <option value="auto">✨ Auto (Follow Style Preset)</option>
+                    <option value="word_fade">🌊 Word-by-Word Fade (වචනයෙන් වචනය)</option>
+                    <option value="soft_fade">🌫️ Soft Line Fade In / Out</option>
+                    <option value="pop_scale">💥 Pop Scale Bounce</option>
+                    <option value="slide_up">⬆️ Smooth Slide Up + Fade</option>
+                    <option value="instant">⚡ Instant Crisp Cut</option>
+                  </select>
+                </div>
+
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-400">
+                    <span>Lyric Display Speed (වේගය)</span>
+                    <div className="flex items-center gap-2">
+                      {Math.abs(lyricAnimationSpeed - 1.0) > 0.01 && (
+                        <button
+                          type="button"
+                          onClick={() => setLyricAnimationSpeed(1.0)}
+                          className="text-[10px] text-zinc-400 underline hover:text-zinc-200"
+                        >
+                          Reset
+                        </button>
+                      )}
+                      <span className="font-mono text-amber-400">
+                        {lyricAnimationSpeed.toFixed(2)}x
+                      </span>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.4"
+                    max="2.5"
+                    step="0.05"
+                    value={lyricAnimationSpeed}
+                    onChange={(e) => setLyricAnimationSpeed(parseFloat(e.target.value))}
+                    className="w-full accent-amber-400"
+                  />
+                  <div className="mt-1.5 flex items-center justify-between gap-1">
+                    {[
+                      { label: "0.6x Slow", val: 0.6 },
+                      { label: "1.0x Normal", val: 1.0 },
+                      { label: "1.5x Fast", val: 1.5 },
+                      { label: "2.0x Snappy", val: 2.0 },
+                    ].map((sp) => (
+                      <button
+                        key={sp.label}
+                        type="button"
+                        onClick={() => setLyricAnimationSpeed(sp.val)}
+                        className={`flex-1 rounded-md border py-1 text-[10px] font-medium transition ${
+                          Math.abs(lyricAnimationSpeed - sp.val) < 0.03
+                            ? "border-amber-400 bg-amber-400/15 text-amber-300"
+                            : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200"
+                        }`}
+                      >
+                        {sp.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
                   <label className="mb-1 flex justify-between text-[11px] text-zinc-400">
                     <span>Font Size</span>
                     <span className="font-mono text-amber-400">{fontSize}px</span>
@@ -6061,13 +6588,13 @@ export default function TikTokLyricsVideoEditor() {
                       <span className="font-mono font-bold text-amber-400">
                         {Math.round(fontBrightness * 100)}%
                       </span>
-                      {Math.abs(fontBrightness - 1.35) > 0.02 && (
+                      {Math.abs(fontBrightness - 1.0) > 0.02 && (
                         <button
                           type="button"
-                          onClick={() => setFontBrightness(1.35)}
+                          onClick={() => setFontBrightness(1.0)}
                           className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.2 text-[9px] text-zinc-400 hover:border-amber-400 hover:text-amber-300"
                         >
-                          Reset (135%)
+                          Reset (100%)
                         </button>
                       )}
                     </div>
@@ -6757,7 +7284,43 @@ export default function TikTokLyricsVideoEditor() {
               >
                 <div
                   ref={previewCardRef}
-                  className="relative flex items-center justify-center overflow-hidden bg-zinc-900 shadow-2xl transition-all duration-300"
+                  onPointerDown={(e) => {
+                    if (!previewClipUrl || e.button !== 0) return;
+                    e.preventDefault();
+                    videoAlignDragRef.current = {
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      origPosX: videoPosXPercent,
+                      origPosY: videoPosYPercent,
+                    };
+                    setIsDraggingVideoAlign(true);
+                  }}
+                  onWheel={(e) => {
+                    if (!previewClipUrl) return;
+                    e.preventDefault();
+                    const delta = e.deltaY < 0 ? 0.05 : -0.05;
+                    setVideoZoom((prev) =>
+                      Math.min(2.5, Math.max(1.0, Number((prev + delta).toFixed(2))))
+                    );
+                  }}
+                  onDoubleClick={() => {
+                    if (!previewClipUrl) return;
+                    setVideoPosXPercent(50);
+                    setVideoPosYPercent(50);
+                    setVideoZoom(1.0);
+                    showToast("🎯 Video zoom & alignment reset (1.00x, 50%, 50%)");
+                  }}
+                  title={
+                    previewClipUrl
+                      ? "Drag to align X/Y • Scroll to zoom & crop • Double-click to reset"
+                      : undefined
+                  }
+                  className={`relative flex items-center justify-center overflow-hidden bg-zinc-900 shadow-2xl select-none transition-all duration-300 ${previewClipUrl
+                    ? isDraggingVideoAlign
+                      ? "cursor-grabbing ring-2 ring-amber-400/70"
+                      : "cursor-grab"
+                    : ""
+                    }`}
                   style={{
                     width: frameLayout === "fullscreen_vertical" ? "100%" : "85.185%",
                     aspectRatio:
@@ -6806,6 +7369,8 @@ export default function TikTokLyricsVideoEditor() {
                       }}
                       className="h-full w-full object-cover transition-transform duration-300"
                       style={{
+                        objectPosition: `${videoPosXPercent}% ${videoPosYPercent}%`,
+                        transformOrigin: `${videoPosXPercent}% ${videoPosYPercent}%`,
                         transform: `scale(${videoZoom}) scaleX(${mirrorFlip ? -1 : 1})`,
                         filter: buildLiveCssFilter(),
                       }}
@@ -6836,6 +7401,12 @@ export default function TikTokLyricsVideoEditor() {
                           "radial-gradient(circle, rgba(0,0,0,0) 48%, rgba(0,0,0,0.68) 100%)",
                       }}
                     />
+                  )}
+
+                  {isDraggingVideoAlign && (
+                    <div className="pointer-events-none absolute top-2 right-2 z-20 rounded-md bg-black/75 px-2 py-0.5 font-mono text-[10px] font-bold text-amber-300 ring-1 ring-amber-400/50 backdrop-blur-sm">
+                      ✥ {videoPosXPercent}% • {videoPosYPercent}% • 🔍 {videoZoom.toFixed(2)}x
+                    </div>
                   )}
 
                   {watermarkText && (
@@ -6873,6 +7444,15 @@ export default function TikTokLyricsVideoEditor() {
                               activeSyncedLine.start,
                               activeSyncedLine.end
                             );
+                        const speed = Math.max(0.4, Math.min(2.5, lyricAnimationSpeed));
+                        const effectiveTrans: Exclude<LyricTransition, "auto"> =
+                          lyricTransition === "auto"
+                            ? stylePreset === "rw_aesthetic_sinhala"
+                              ? "word_fade"
+                              : stylePreset === "soft_line_fade"
+                                ? "soft_fade"
+                                : "pop_scale"
+                            : lyricTransition;
                         const relMs =
                           (currentAudioTime -
                             (activeSyncedLine.start + lyricsOffsetSec)) *
@@ -6881,13 +7461,45 @@ export default function TikTokLyricsVideoEditor() {
                           400,
                           (activeSyncedLine.end - activeSyncedLine.start) * 1000
                         );
+                        const fadeOutWindowMs =
+                          effectiveTrans === "instant"
+                            ? 35
+                            : Math.max(40, Math.round(200 / speed));
+                        const fadeInWindowMs =
+                          effectiveTrans === "instant"
+                            ? 35
+                            : Math.max(45, Math.round(220 / speed));
                         const fadeOutAlpha =
-                          relMs > lineDurMs - 180
-                            ? Math.max(0.05, (lineDurMs - relMs) / 180)
+                          relMs > lineDurMs - fadeOutWindowMs
+                            ? Math.max(0.05, (lineDurMs - relMs) / fadeOutWindowMs)
                             : 1;
+                        const lineFadeInAlpha =
+                          relMs < fadeInWindowMs
+                            ? Math.max(0.05, relMs / fadeInWindowMs)
+                            : 1;
+                        const lineScale =
+                          effectiveTrans === "pop_scale"
+                            ? relMs < Math.round(110 / speed)
+                              ? 1 + 0.08 * Math.max(0, relMs / Math.max(1, 110 / speed))
+                              : relMs < Math.round(220 / speed)
+                                ? 1.08 -
+                                  0.08 *
+                                    ((relMs - Math.round(110 / speed)) /
+                                      Math.max(1, 110 / speed))
+                                : 1
+                            : 1;
+                        const slideDurMs = Math.max(60, Math.round(260 / speed));
+                        const lineTranslateY =
+                          effectiveTrans === "slide_up" && relMs < slideDurMs
+                            ? Math.round(14 * (1 - Math.max(0, relMs) / slideDurMs))
+                            : 0;
+                        const wholeLineAlpha =
+                          effectiveTrans === "word_fade"
+                            ? 1
+                            : Math.max(0.05, Math.min(1, lineFadeInAlpha * fadeOutAlpha));
                         return (
                           <p
-                            className="leading-snug transition-opacity duration-150"
+                            className="leading-snug"
                             style={{
                               fontFamily: getCssFontFamily(selectedFontFamily),
                               fontSize: `${liveCaptionFontSizePx}px`,
@@ -6897,17 +7509,22 @@ export default function TikTokLyricsVideoEditor() {
                               WebkitTextStroke: liveCaptionTextStroke,
                               paintOrder: "stroke fill",
                               textShadow: liveCaptionTextShadow,
+                              opacity: wholeLineAlpha,
+                              transform: `translateY(${lineTranslateY}px) scale(${lineScale})`,
+                              transition: `opacity ${Math.max(30, Math.round(90 / speed))}ms linear, transform ${Math.max(30, Math.round(90 / speed))}ms ease-out`,
                             }}
                           >
-                            {previewWords.length > 0
+                            {effectiveTrans === "word_fade" && previewWords.length > 0
                               ? previewWords.map((wt, wIdx) => {
+                                const rawWordDur = Math.max(wt.end_ms - wt.start_ms, 100);
+                                const scaledEnd = wt.start_ms + Math.max(45, rawWordDur / speed);
                                 const wordAlpha =
                                   relMs <= wt.start_ms
                                     ? 0.08
-                                    : relMs >= wt.end_ms
+                                    : relMs >= scaledEnd
                                       ? 1.0
                                       : (relMs - wt.start_ms) /
-                                      Math.max(wt.end_ms - wt.start_ms, 100);
+                                      Math.max(scaledEnd - wt.start_ms, 45);
                                 return (
                                   <span
                                     key={wIdx}
@@ -6916,7 +7533,7 @@ export default function TikTokLyricsVideoEditor() {
                                         0.05,
                                         Math.min(1, wordAlpha * fadeOutAlpha)
                                       ),
-                                      transition: "opacity 90ms linear",
+                                      transition: `opacity ${Math.max(30, Math.round(90 / speed))}ms linear`,
                                     }}
                                   >
                                     {formatActiveFontText(wt.word)}{" "}
@@ -7036,6 +7653,70 @@ export default function TikTokLyricsVideoEditor() {
               </div>
             )}
           </div>
+
+          {/* Quick Zoom & Crop Controls directly under Live 9:16 Preview */}
+          {activePreviewTab === "canvas" && (
+            <div className="relative z-10 mb-2 flex w-full max-w-3xl flex-wrap items-center justify-between gap-2 rounded-xl border border-zinc-800/80 bg-zinc-950/85 px-3 py-1.5 text-[11px] backdrop-blur-md">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-zinc-300">🔍 Zoom &amp; Crop</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setVideoZoom((prev) => Math.max(1.0, Number((prev - 0.05).toFixed(2))))
+                  }
+                  disabled={videoZoom <= 1.0}
+                  title="Zoom out"
+                  className="flex h-6 w-6 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 font-bold text-zinc-300 transition hover:border-amber-400/50 hover:text-amber-300 disabled:opacity-40"
+                >
+                  -
+                </button>
+                <input
+                  type="range"
+                  min="1.0"
+                  max="2.5"
+                  step="0.05"
+                  value={videoZoom}
+                  onChange={(e) => setVideoZoom(parseFloat(e.target.value))}
+                  aria-label="Preview Zoom & Crop"
+                  className="w-28 sm:w-36 accent-amber-400"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    setVideoZoom((prev) => Math.min(2.5, Number((prev + 0.05).toFixed(2))))
+                  }
+                  disabled={videoZoom >= 2.5}
+                  title="Zoom in"
+                  className="flex h-6 w-6 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 font-bold text-zinc-300 transition hover:border-amber-400/50 hover:text-amber-300 disabled:opacity-40"
+                >
+                  +
+                </button>
+                <span className="min-w-[42px] font-mono font-bold text-amber-300">
+                  {videoZoom.toFixed(2)}x
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="rounded-md bg-zinc-900 px-2 py-0.5 font-mono text-[10px] text-zinc-400">
+                  ✥ {videoPosXPercent}% • {videoPosYPercent}%
+                </span>
+                {(videoZoom > 1.01 || videoPosXPercent !== 50 || videoPosYPercent !== 50) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVideoZoom(1.0);
+                      setVideoPosXPercent(50);
+                      setVideoPosYPercent(50);
+                      showToast("🎯 Zoom & crop reset to default (1.00x, 50%, 50%)");
+                    }}
+                    className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-300 transition hover:bg-amber-500/20"
+                  >
+                    Reset Crop
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Synchronized Player Transport Bar below Preview */}
           <div className="relative z-10 flex w-full max-w-3xl flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800/90 bg-zinc-950/90 px-4 py-2 shadow-xl backdrop-blur-md">
@@ -7225,18 +7906,36 @@ export default function TikTokLyricsVideoEditor() {
               <button
                 type="button"
                 disabled={visualClips.length === 0}
+                onClick={() => handleTrimVideoAtPlayhead("in")}
+                title="Trim Video Start ([ In) to current playhead"
+                className="rounded bg-zinc-900/90 px-1.5 py-0.5 text-[10px] font-bold text-sky-200 hover:bg-sky-500/25 disabled:opacity-40"
+              >
+                [ Trim In
+              </button>
+              <button
+                type="button"
+                disabled={visualClips.length === 0}
+                onClick={() => handleTrimVideoAtPlayhead("out")}
+                title="Trim Video End (Out ]) to current playhead"
+                className="rounded bg-zinc-900/90 px-1.5 py-0.5 text-[10px] font-bold text-sky-200 hover:bg-sky-500/25 disabled:opacity-40"
+              >
+                Trim Out ]
+              </button>
+              <button
+                type="button"
+                disabled={visualClips.length === 0}
                 onClick={() => handleDeleteVideoSegment()}
                 title={
                   effectiveVideoSegments.length > 1
-                    ? "Delete selected bladed video part"
-                    : "Delete main video clip"
+                    ? `Delete selected cut video Part #${(selectedVideoSegmentIdx ?? 0) + 1}`
+                    : "Split the video first using Razor / Blade Video to delete an unwanted section"
                 }
                 className="inline-flex items-center gap-1 rounded bg-red-500/20 border border-red-500/40 px-2 py-0.5 text-[10px] font-bold text-red-200 hover:bg-red-500/35 disabled:opacity-40"
               >
                 <Trash2 className="h-3 w-3" />
                 {effectiveVideoSegments.length > 1
                   ? `Delete Part #${(selectedVideoSegmentIdx ?? 0) + 1}`
-                  : "Delete Video"}
+                  : "Delete Part"}
               </button>
               {(videoSegments.length > 1 || clipTrimStart > 0 || clipTrimEnd > 0) && (
                 <button
@@ -7718,7 +8417,7 @@ export default function TikTokLyricsVideoEditor() {
                             );
                             if (isVideoBladeMode) {
                               seekAudioTo(clickedTimelineSec);
-                              handleBladeVideoSegmentAtSourceTime(segIdx, clickedSourceSec);
+                              handleBladeVideoSegmentAtSourceTime(segIdx, clickedSourceSec, true);
                               return;
                             }
                             setSelectedVideoSegmentIdx(segIdx);
@@ -7762,21 +8461,28 @@ export default function TikTokLyricsVideoEditor() {
                             >
                               ✂️ Cut
                             </button>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleDeleteVideoSegment(segIdx);
-                              }}
-                              title={
-                                effectiveVideoSegments.length > 1
-                                  ? `Delete Part #${segIdx + 1}`
-                                  : "Delete main video clip"
-                              }
-                              className="rounded bg-red-600/80 px-1 py-0.5 text-[9px] font-bold text-white hover:bg-red-500"
-                            >
-                              🗑️ Del
-                            </button>
+                            {(effectiveVideoSegments.length > 1 || (visualClips.length > 1 && selectedSingleClipIdx === null)) && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (visualClips.length > 1 && selectedSingleClipIdx === null && effectiveVideoSegments.length <= 1) {
+                                    const clipToDrop = (loopIdx + segIdx) % visualClips.length;
+                                    handleRemoveVisualClip(clipToDrop);
+                                  } else {
+                                    handleDeleteVideoSegment(segIdx);
+                                  }
+                                }}
+                                title={
+                                  visualClips.length > 1 && selectedSingleClipIdx === null && effectiveVideoSegments.length <= 1
+                                    ? `Remove Mix Clip #${((loopIdx + segIdx) % visualClips.length) + 1}`
+                                    : `Delete Part #${segIdx + 1}`
+                                }
+                                className="rounded bg-red-600/80 px-1 py-0.5 text-[9px] font-bold text-white hover:bg-red-500"
+                              >
+                                🗑️ Del
+                              </button>
+                            )}
                           </div>
                         </div>
                       );

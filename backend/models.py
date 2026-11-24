@@ -37,6 +37,15 @@ class LoopMode(str, Enum):
     PINGPONG = "pingpong"
 
 
+class LyricTransition(str, Enum):
+    AUTO = "auto"
+    WORD_FADE = "word_fade"
+    SOFT_FADE = "soft_fade"
+    POP_SCALE = "pop_scale"
+    SLIDE_UP = "slide_up"
+    INSTANT = "instant"
+
+
 class WordTiming(BaseModel):
     """Acoustic timing for a single word within a lyric line."""
     word: str
@@ -61,12 +70,22 @@ class VideoEditConfig(BaseModel):
     frame_layout: FrameLayout = FrameLayout.ROUNDED_SQUARE_CARD
     color_grade: ColorGradePreset = ColorGradePreset.GOLDEN_SUNSET
     style_preset: StylePreset = StylePreset.RW_AESTHETIC_SINHALA
+    lyric_transition: LyricTransition = Field(
+        default=LyricTransition.AUTO,
+        description="Lyric display transition style (auto = follow style preset default)",
+    )
+    lyric_animation_speed: float = Field(
+        default=1.0,
+        ge=0.4,
+        le=2.5,
+        description="Lyric reveal & transition speed multiplier (0.4x slow - 2.5x fast)",
+    )
 
     # Custom Sinhala / Font Typography Controls
     font_family: str = Field(default="Sinhala Sangam MN", description="Font family name (system or custom TTF/OTF)")
     font_size: int = Field(default=40, ge=16, le=110)
     font_thickness: float = Field(default=0.0, ge=0.0, le=4.0, description="Extra stroke thickness (0 = original font weight)")
-    font_brightness: float = Field(default=1.35, ge=0.4, le=2.0, description="Font brightness & luminance glow multiplier (1.0 = normal, >1.0 = bright glow boost)")
+    font_brightness: float = Field(default=1.0, ge=0.4, le=2.0, description="Font brightness & luminance glow multiplier (1.0 = normal, >1.0 = bright glow boost)")
     primary_color_hex: str = Field(default="#FFFFFF", description="Hex text color e.g. #FFFFFF")
     outline_width: float = Field(default=1.8, ge=0.0, le=10.0)
     shadow_depth: float = Field(default=2.8, ge=0.0, le=10.0)
@@ -91,7 +110,9 @@ class VideoEditConfig(BaseModel):
         default=LoopMode.CROSSFADE,
         description="Smooth Crossfade loop, Normal loop, or Ping-Pong (Boomerang) loop to match song duration",
     )
-    video_zoom: float = Field(default=1.0, ge=1.0, le=1.6, description="Zoom factor (useful to crop out AI watermarks)")
+    video_zoom: float = Field(default=1.0, ge=1.0, le=2.5, description="Zoom factor (useful to crop out AI watermarks)")
+    video_pos_x_percent: float = Field(default=50.0, ge=0.0, le=100.0, description="Horizontal video crop/pan alignment (0=left, 50=center, 100=right)")
+    video_pos_y_percent: float = Field(default=50.0, ge=0.0, le=100.0, description="Vertical video crop/pan alignment (0=top, 50=center, 100=bottom)")
     mirror_flip: bool = Field(default=False, description="Flip video horizontally (Mirror)")
     brightness: float = Field(default=-0.3, ge=-0.6, le=0.6, description="Video-only brightness adjustment (does not affect captions)")
     contrast: float = Field(default=1.0, ge=0.5, le=1.8)

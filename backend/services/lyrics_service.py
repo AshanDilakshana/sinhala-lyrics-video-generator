@@ -1,11 +1,19 @@
 import asyncio
+import base64
+import json
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import httpx
 
-from backend.config import SP_DC_COOKIE, SPOTIFY_LYRICS_API_URL, create_resilient_async_client
+from backend.config import (
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    SP_DC_COOKIE,
+    SPOTIFY_LYRICS_API_URL,
+    create_resilient_async_client,
+)
 from backend.models import LyricLine, LyricsResult, LyricsSourceTier
 from backend.services.alignment_service import (
     _clean_lyrics_lines,
@@ -652,6 +660,231 @@ async def _fetch_and_verify_sequential_sites(
     return None, unverified_pool
 
 
+async def identify_and_transcribe_with_gemini(
+    audio_path: Path,
+    job_temp_dir: Path,
+    language: str = "si",
+) -> Optional[Dict[str, object]]:
+    """
+    Use Google Gemini AI (`GEMINI_API_KEY`) to listen to the audio clip, identify the
+    song title/artist, and transcribe the sung lyrics line-by-line.
+    Caches results per `job_temp_dir` to conserve free-tier RPM quota.
+    """
+    if not GEMINI_API_KEY or not audio_path.exists():
+        return None
+
+    cache_file = job_temp_dir / "gemini_lyrics_cache.json"
+    audio_size = audio_path.stat().st_size
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if cached.get("audio_size") == audio_size and cached.get("result"):
+                return cached["result"]
+        except Exception:
+            pass
+
+    if audio_size > 18 * 1024 * 1024:
+        return None
+
+    ext = audio_path.suffix.lower()
+    mime_type = (
+        "audio/mp4" if ext in (".m4a", ".mp4") else "audio/mpeg" if ext == ".mp3" else "audio/wav"
+    )
+    b64_data = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+    lang_hint = "Sinhala Unicode" if _is_sinhala_lang(language) else "the sung language"
+    prompt = (
+        f"Listen carefully to this song clip. Identify the song title and artist if known, "
+        f"and transcribe the exact lyrics sung in this audio clip line by line in {lang_hint}. "
+        f'Return ONLY valid JSON: {{"title": "...", "artist": "...", "lines": ["..."]}}'
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": b64_data}},
+                    {"text": prompt},
+                ]
+            }
+        ],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
+    }
+
+    models_to_try = [GEMINI_MODEL]
+    if GEMINI_MODEL != "gemini-2.5-flash":
+        models_to_try.append("gemini-2.5-flash")
+    models_to_try.append("gemini-3.1-flash-lite-preview")
+
+    async with create_resilient_async_client(timeout=28.0) as client:
+        for mdl in models_to_try:
+            try:
+                resp = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent",
+                    params={"key": GEMINI_API_KEY},
+                    json=payload,
+                )
+                if resp.status_code == 429 or resp.status_code == 404:
+                    logger.info("Gemini model %s returned HTTP %d; trying fallback if available.", mdl, resp.status_code)
+                    continue
+                if resp.status_code != 200:
+                    logger.warning("Gemini API returned HTTP %d: %s", resp.status_code, resp.text[:200])
+                    return None
+                data = resp.json()
+                raw_txt = (
+                    ((data.get("candidates") or [{}])[0].get("content") or {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                if not raw_txt:
+                    continue
+                parsed = json.loads(raw_txt)
+                if not isinstance(parsed, dict):
+                    continue
+                title = str(parsed.get("title") or "").strip()
+                artist = str(parsed.get("artist") or "").strip()
+                lines = [
+                    str(ln).strip()
+                    for ln in (parsed.get("lines") or [])
+                    if str(ln).strip()
+                ]
+                result = {"title": title, "artist": artist, "lines": lines}
+                try:
+                    cache_file.write_text(
+                        json.dumps({"audio_size": audio_size, "result": result}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "Gemini AI (%s) identified song title=%r artist=%r (%d transcribed lines)",
+                    mdl,
+                    title,
+                    artist,
+                    len(lines),
+                )
+                return result
+            except Exception as exc:
+                logger.warning("Gemini AI request failed on %s: %s", mdl, exc)
+                continue
+    return None
+
+
+async def search_full_song_with_gemini_grounding(
+    sung_lines: List[str],
+    job_temp_dir: Path,
+    hint_title: str = "",
+    hint_artist: str = "",
+    language: str = "si",
+) -> Optional[Dict[str, str]]:
+    """
+    Use Gemini + Google Search Grounding (`tools: [{"google_search": {}}]`) from actual
+    heard Sinhala lines to identify the true song title, original artist, and complete full song lyrics.
+    """
+    if not GEMINI_API_KEY or not sung_lines:
+        return None
+
+    cache_file = job_temp_dir / "gemini_grounded_song.json"
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if cached.get("lyrics_text"):
+                return cached
+        except Exception:
+            pass
+
+    snippet = " ".join(ln.strip() for ln in sung_lines[:6] if ln.strip())
+    if not snippet:
+        return None
+
+    lang_label = "Sinhala Unicode" if _is_sinhala_lang(language) else "the original song language"
+    prompt = (
+        f'Search Google for the song that contains these exact sung lyrics: "{snippet}".\n'
+        f"Identify the true original Song Title and Artist, and provide the COMPLETE full song lyrics "
+        f"(every verse and chorus from start to finish) in {lang_label}.\n"
+        f"Format your response strictly as:\n"
+        f"TITLE: <song title>\n"
+        f"ARTIST: <artist name>\n"
+        f"LYRICS:\n"
+        f"<line 1>\n"
+        f"<line 2>\n..."
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1},
+    }
+
+    models_to_try = [GEMINI_MODEL]
+    if GEMINI_MODEL != "gemini-2.5-flash":
+        models_to_try.append("gemini-2.5-flash")
+
+    async with create_resilient_async_client(timeout=30.0) as client:
+        for mdl in models_to_try:
+            try:
+                resp = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent",
+                    params={"key": GEMINI_API_KEY},
+                    json=payload,
+                )
+                if resp.status_code in (400, 404, 429):
+                    continue
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+                parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                raw_txt = "\n".join(str(p.get("text") or "") for p in parts if p.get("text")).strip()
+                if not raw_txt:
+                    continue
+
+                title_val = ""
+                artist_val = ""
+                lyrics_lines: List[str] = []
+                in_lyrics = False
+                for raw_ln in raw_txt.splitlines():
+                    s = raw_ln.strip()
+                    s_clean = re.sub(r"^[#*\-\s]+", "", s).replace("**", "").strip()
+                    if not in_lyrics:
+                        if s_clean.upper().startswith("TITLE:"):
+                            title_val = s_clean.split(":", 1)[1].strip().strip("*\"'")
+                            continue
+                        if s_clean.upper().startswith("ARTIST:"):
+                            artist_val = s_clean.split(":", 1)[1].strip().strip("*\"'")
+                            continue
+                        if s_clean.upper().startswith("LYRICS:"):
+                            in_lyrics = True
+                            continue
+                    else:
+                        if s.startswith("```"):
+                            continue
+                        if s and not s.startswith(("[", "(")) or (s.startswith("(") and len(s) > 12):
+                            lyrics_lines.append(s)
+
+                clean_lyrics = "\n".join(_clean_lyrics_lines("\n".join(lyrics_lines)))
+                if len(clean_lyrics.splitlines()) < 4:
+                    continue
+
+                result = {
+                    "title": title_val,
+                    "artist": artist_val,
+                    "lyrics_text": clean_lyrics,
+                }
+                try:
+                    cache_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+                logger.info(
+                    "Gemini Google Search Grounding found '%s' by '%s' (%d full lines)",
+                    title_val,
+                    artist_val,
+                    len(clean_lyrics.splitlines()),
+                )
+                return result
+            except Exception as exc:
+                logger.warning("Gemini grounding search failed on %s: %s", mdl, exc)
+                continue
+    return None
+
+
 async def resolve_synced_lyrics(
     audio_path: Path,
     job_temp_dir: Path,
@@ -789,6 +1022,90 @@ async def resolve_synced_lyrics(
             res.detected_artist = res.detected_artist or caught_artist or None
             return res
 
+    # If Shazam/metadata did not yield a verified web match, ask Gemini AI (`GEMINI_API_KEY`)
+    # to listen to the audio & identify the song, then ground via Google Search for FULL song lyrics!
+    gemini_src = fingerprint_source if (fingerprint_source and fingerprint_source.exists()) else audio_path
+    gem_info = await identify_and_transcribe_with_gemini(
+        audio_path=gemini_src,
+        job_temp_dir=job_temp_dir,
+        language=language,
+    )
+    gem_lines_list: List[str] = []
+    if gem_info:
+        gem_title = re.sub(r"\([^)]*\)", "", str(gem_info.get("title") or "")).strip()
+        gem_artist = str(gem_info.get("artist") or "").strip()
+        gem_lines_list = [str(l).strip() for l in (gem_info.get("lines") or []) if str(l).strip()]
+        if gem_title:
+            caught_title = gem_title
+        if gem_artist:
+            caught_artist = gem_artist
+        if gem_title:
+            gem_pairs = [
+                p for p in extract_song_search_candidates(gem_title, gem_artist)
+                if (p[0].lower(), p[1].lower()) not in seen_pair_keys
+            ]
+            if gem_pairs:
+                for p in gem_pairs:
+                    seen_pair_keys.add((p[0].lower(), p[1].lower()))
+                    search_pairs.append(p)
+                res_gem, pool_gem = await _fetch_and_verify_sequential_sites(
+                    search_pairs=gem_pairs,
+                    audio_path=audio_path,
+                    job_temp_dir=job_temp_dir,
+                    total_duration=total_duration,
+                    language=language,
+                    shazam_clip_offset_sec=shazam_clip_offset_sec,
+                    shazam_time_skew=shazam_time_skew,
+                    shazam_lyrics_text=shazam_lyrics_text,
+                    hint_texts=hint_texts,
+                )
+                unverified_pool.extend(pool_gem)
+                if res_gem:
+                    res_gem.detected_title = res_gem.detected_title or caught_title or None
+                    res_gem.detected_artist = res_gem.detected_artist or caught_artist or None
+                    return res_gem
+
+    # Use Google Search grounding via Gemini on the heard Sinhala lines to retrieve the true
+    # song title, artist, and COMPLETE full-song lyrics even when Shazam/local hubs miss it.
+    has_grounded_full = False
+    if gem_lines_list:
+        grounded = await search_full_song_with_gemini_grounding(
+            sung_lines=gem_lines_list,
+            job_temp_dir=job_temp_dir,
+            hint_title=caught_title,
+            hint_artist=caught_artist,
+            language=language,
+        )
+        if grounded and grounded.get("lyrics_text"):
+            has_grounded_full = True
+            if grounded.get("title"):
+                caught_title = grounded["title"]
+            if grounded.get("artist"):
+                caught_artist = grounded["artist"]
+            g_src, g_aligned = await select_and_align_best_lyrics_candidate(
+                audio_path=audio_path,
+                candidates=[("Gemini Google Search (Full Song)", grounded["lyrics_text"])],
+                job_temp_dir=job_temp_dir,
+                total_duration=total_duration,
+                language=language,
+                fallback_to_auto=False,
+                clip_offset_sec=shazam_clip_offset_sec,
+                hint_texts=hint_texts,
+            )
+            if g_src and g_aligned:
+                return LyricsResult(
+                    tier=LyricsSourceTier.TIER_3_ALIGNMENT,
+                    lines=g_aligned,
+                    raw_lrc=lines_to_lrc(g_aligned),
+                    full_lyrics_text=grounded["lyrics_text"],
+                    detected_title=caught_title or None,
+                    detected_artist=caught_artist or None,
+                    lyrics_source=g_src,
+                )
+            unverified_pool.insert(0, ("Gemini Google Search (Full Song)", grounded["lyrics_text"]))
+    if not has_grounded_full and gem_lines_list and len(gem_lines_list) >= 2:
+        unverified_pool.append(("Gemini AI (Audio Lyrics)", "\n".join(gem_lines_list)))
+
     # If Google ASR was offline (`not asr_windows`) yet a web site DID return lyrics, align acoustically;
     # otherwise fall back cleanly to Mode A Auto-Captions.
     # Also ensure that if we detected a song title (via Shazam or metadata) and `unverified_pool` is still empty,
@@ -876,7 +1193,18 @@ async def resolve_synced_lyrics(
     )
     source_label = matched_source if matched_source != "auto_asr" else f"Auto-Captions ({language})"
     if matched_source == "auto_asr":
-        clean_full_pool = ""
+        # Even when timeline falls back to Auto-Captions for the trimmed clip,
+        # keep the fullest fetched song lyrics (from Sri Lankan hubs / LRCLIB / Shazam)
+        # so the Full Text tab displays the entire song rather than only the clip's time range.
+        pool_texts = [txt for _, txt in unverified_pool if txt and txt.strip()]
+        if shazam_lyrics_text and shazam_lyrics_text.strip():
+            pool_texts.append(shazam_lyrics_text)
+        best_full_raw = (
+            max(pool_texts, key=lambda t: len(_clean_lyrics_lines(t)))
+            if pool_texts
+            else ""
+        )
+        clean_full_pool = "\n".join(_clean_lyrics_lines(best_full_raw)) if best_full_raw else ""
     else:
         matched_full_raw = next(
             (txt for s, txt in unverified_pool if s == matched_source and txt.strip()),
