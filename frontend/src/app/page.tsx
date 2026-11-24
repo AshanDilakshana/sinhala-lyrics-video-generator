@@ -505,26 +505,39 @@ function buildWordTimingsForLine(
   if (words.length === 0) return [];
 
   const newDurMs = Math.max(400, Math.round((endSec - startSec) * 1000));
-  const prevWords = prevLine?.words;
   const sameText =
     prevLine &&
-    prevLine.text.trim().replace(/\s+/g, " ") === words.join(" ") &&
-    Array.isArray(prevWords) &&
-    prevWords.length === words.length;
+    prevLine.text.trim().replace(/\s+/g, " ") === words.join(" ");
 
-  if (sameText && prevWords) {
+  if (sameText && prevLine) {
+    const baseWords =
+      Array.isArray(prevLine.words) && prevLine.words.length === words.length
+        ? prevLine.words
+        : buildWordTimingsForLine(words.join(" "), prevLine.start, prevLine.end);
+
     const oldDurMs = Math.max(
       400,
-      Math.round(((prevLine?.end ?? endSec) - (prevLine?.start ?? startSec)) * 1000)
+      Math.round((prevLine.end - prevLine.start) * 1000)
     );
-    const ratio = newDurMs / oldDurMs;
-    return prevWords.map((wt, idx) => {
-      const scaledStart = Math.round(wt.start_ms * ratio);
-      const scaledEnd = Math.round(wt.end_ms * ratio);
-      const clampedStart = Math.max(0, Math.min(scaledStart, Math.max(0, newDurMs - 140)));
+    const isPureMove =
+      Math.abs(newDurMs - oldDurMs) <= 25 &&
+      Math.abs(startSec - prevLine.start) > 0.005;
+    // Anchor words to their original song-time positions when extending/trimming
+    // start or end edges so holding a line longer NEVER delays word-by-word vocal sync.
+    const startShiftMs = isPureMove
+      ? 0
+      : Math.round((prevLine.start - startSec) * 1000);
+
+    return baseWords.map((wt, idx) => {
+      const shiftedStart = wt.start_ms + startShiftMs;
+      const shiftedEnd = wt.end_ms + startShiftMs;
+      const clampedStart = Math.max(
+        0,
+        Math.min(shiftedStart, Math.max(0, newDurMs - 140))
+      );
       const clampedEnd = Math.max(
-        clampedStart + 100,
-        Math.min(scaledEnd, Math.max(clampedStart + 100, newDurMs - 60))
+        clampedStart + 90,
+        Math.min(shiftedEnd, Math.max(clampedStart + 90, newDurMs - 40))
       );
       return {
         word: words[idx],
@@ -5356,13 +5369,28 @@ export default function TikTokLyricsVideoEditor() {
                               <span>
                                 👆 Click any lyric line below to set where the song starts &amp; sync from that line forward ({fullSongLines.length} full song lines):
                               </span>
-                              <button
-                                type="button"
-                                onClick={() => setIsEditingFullLyricsText((prev) => !prev)}
-                                className="shrink-0 rounded border border-amber-400/40 bg-zinc-900 px-2 py-0.5 text-[10px] font-bold text-amber-300 hover:bg-amber-400 hover:text-black"
-                              >
-                                {isEditingFullLyricsText ? "📋 Line Picker" : "✏️ Edit Text"}
-                              </button>
+                              <div className="flex shrink-0 items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={isSearchingWebLyrics}
+                                  onClick={() =>
+                                    handleSearchSinhalaLyrics(
+                                      songName.trim() || editableTimeline[0]?.text || ""
+                                    )
+                                  }
+                                  title="Search & upgrade full song lyrics from web / Gemini"
+                                  className="rounded border border-emerald-400/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-300 hover:bg-emerald-500 hover:text-black disabled:opacity-40"
+                                >
+                                  {isSearchingWebLyrics ? "Searching..." : "🔍 Fetch Full"}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setIsEditingFullLyricsText((prev) => !prev)}
+                                  className="rounded border border-amber-400/40 bg-zinc-900 px-2 py-0.5 text-[10px] font-bold text-amber-300 hover:bg-amber-400 hover:text-black"
+                                >
+                                  {isEditingFullLyricsText ? "📋 Line Picker" : "✏️ Edit Text"}
+                                </button>
+                              </div>
                             </div>
 
                             {!isEditingFullLyricsText && fullSongLines.length > 0 ? (

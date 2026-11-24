@@ -779,7 +779,7 @@ async def search_full_song_with_gemini_grounding(
     Use Gemini + Google Search Grounding (`tools: [{"google_search": {}}]`) from actual
     heard Sinhala lines to identify the true song title, original artist, and complete full song lyrics.
     """
-    if not GEMINI_API_KEY or not sung_lines:
+    if not GEMINI_API_KEY or (not sung_lines and not (hint_title or "").strip()):
         return None
 
     cache_file = job_temp_dir / "gemini_grounded_song.json"
@@ -791,15 +791,23 @@ async def search_full_song_with_gemini_grounding(
         except Exception:
             pass
 
-    snippet = " ".join(ln.strip() for ln in sung_lines[:6] if ln.strip())
-    if not snippet:
+    snippet = " ".join(ln.strip() for ln in (sung_lines or [])[:6] if ln.strip())
+    title_hint = (hint_title or "").strip()
+    artist_hint = (hint_artist or "").strip()
+    if not snippet and not title_hint:
         return None
 
     lang_label = "Sinhala Unicode" if _is_sinhala_lang(language) else "the original song language"
+    search_target = (
+        f'the song "{title_hint}"' + (f' by "{artist_hint}"' if artist_hint else "")
+        if title_hint
+        else f'the song containing these lyrics: "{snippet}"'
+    )
+    extra_clue = f'\nSung lyrics clue: "{snippet}".' if (title_hint and snippet) else ""
     prompt = (
-        f'Search Google for the song that contains these exact sung lyrics: "{snippet}".\n'
+        f"Search Google for {search_target}.{extra_clue}\n"
         f"Identify the true original Song Title and Artist, and provide the COMPLETE full song lyrics "
-        f"(every verse and chorus from start to finish) in {lang_label}.\n"
+        f"(every verse, pre-chorus, chorus, and bridge from start to finish — do NOT truncate) in {lang_label}.\n"
         f"Format your response strictly as:\n"
         f"TITLE: <song title>\n"
         f"ARTIST: <artist name>\n"
@@ -1003,6 +1011,35 @@ async def resolve_synced_lyrics(
             seen_pair_keys.add(key)
             search_pairs.append(pair)
 
+    async def _ensure_full_song_text(
+        result_obj: LyricsResult,
+        clue_lines: List[str],
+    ) -> LyricsResult:
+        """If `full_lyrics_text` looks truncated (< 16 lines), try Gemini Google Search
+        Grounding by title/lyrics so the Full Text tab holds the complete song."""
+        cur_lines = _clean_lyrics_lines(result_obj.full_lyrics_text or "")
+        if len(cur_lines) >= 16:
+            return result_obj
+        t_hint = result_obj.detected_title or caught_title
+        a_hint = result_obj.detected_artist or caught_artist
+        if GEMINI_API_KEY and (t_hint or clue_lines):
+            grounded_up = await search_full_song_with_gemini_grounding(
+                sung_lines=clue_lines or [l.text for l in result_obj.lines[:5]],
+                job_temp_dir=job_temp_dir,
+                hint_title=t_hint,
+                hint_artist=a_hint,
+                language=language,
+            )
+            if grounded_up and grounded_up.get("lyrics_text"):
+                up_lines = _clean_lyrics_lines(grounded_up["lyrics_text"])
+                if len(up_lines) > len(cur_lines):
+                    result_obj.full_lyrics_text = "\n".join(up_lines)
+                    if grounded_up.get("title") and not result_obj.detected_title:
+                        result_obj.detected_title = grounded_up["title"]
+                    if grounded_up.get("artist") and not result_obj.detected_artist:
+                        result_obj.detected_artist = grounded_up["artist"]
+        return result_obj
+
     unverified_pool: List[Tuple[str, str]] = []
     if search_pairs or shazam_lyrics_text:
         res, pool = await _fetch_and_verify_sequential_sites(
@@ -1020,7 +1057,7 @@ async def resolve_synced_lyrics(
         if res:
             res.detected_title = res.detected_title or caught_title or None
             res.detected_artist = res.detected_artist or caught_artist or None
-            return res
+            return await _ensure_full_song_text(res, [])
 
     # If Shazam/metadata did not yield a verified web match, ask Gemini AI (`GEMINI_API_KEY`)
     # to listen to the audio & identify the song, then ground via Google Search for FULL song lyrics!
@@ -1065,10 +1102,10 @@ async def resolve_synced_lyrics(
                     res_gem.detected_artist = res_gem.detected_artist or caught_artist or None
                     return res_gem
 
-    # Use Google Search grounding via Gemini on the heard Sinhala lines to retrieve the true
-    # song title, artist, and COMPLETE full-song lyrics even when Shazam/local hubs miss it.
+    # Use Google Search grounding via Gemini on the heard Sinhala lines (or detected title)
+    # to retrieve the true song title, artist, and COMPLETE full-song lyrics even when Shazam/local hubs miss it.
     has_grounded_full = False
-    if gem_lines_list:
+    if gem_lines_list or caught_title:
         grounded = await search_full_song_with_gemini_grounding(
             sung_lines=gem_lines_list,
             job_temp_dir=job_temp_dir,
@@ -1212,7 +1249,7 @@ async def resolve_synced_lyrics(
         )
         clean_full_pool = "\n".join(_clean_lyrics_lines(matched_full_raw)) if matched_full_raw else ""
 
-    return LyricsResult(
+    final_res = LyricsResult(
         tier=LyricsSourceTier.TIER_3_ALIGNMENT,
         lines=aligned_lines,
         raw_lrc=lines_to_lrc(aligned_lines),
@@ -1221,4 +1258,5 @@ async def resolve_synced_lyrics(
         detected_artist=caught_artist or None,
         lyrics_source=source_label,
     )
+    return await _ensure_full_song_text(final_res, gem_lines_list)
 
